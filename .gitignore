@@ -1,2 +1,32 @@
+# legacy notebooks kept for reference but not part of the active codebase
+legacy/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# jupyter checkpoints
+.ipynb_checkpoints/
+
+# claude code
+.claude/
+
+# data files
 bookDepth_data/
 trades_data/
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
