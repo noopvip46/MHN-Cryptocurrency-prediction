@@ -18,6 +18,9 @@ __pycache__/
 bookDepth_data/
 trades_data/
 
+# Environment variables
+.env
+
 # virtual environments
 .venv/
 venv/

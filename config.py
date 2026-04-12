@@ -3,6 +3,7 @@ from pathlib import Path
 ROOT_DIR        = Path(__file__).resolve().parent
 BOOK_DEPTH_DIR  = ROOT_DIR / "bookDepth_data"
 TRADES_DIR      = ROOT_DIR / "trades_data"
+ONCHAIN_DIR     = ROOT_DIR / "onchain_data"
 PROCESSED_DIR   = ROOT_DIR / "bookDepth_data"  # processed CSVs live alongside raw data
 
 ALL_PAIRS_CLEANED = PROCESSED_DIR / "all_pairs_cleaned.csv"
@@ -23,3 +24,15 @@ LABEL_PAIR    = "BTCUSDT"  # primary pair we generate the label for
 SEQ_LEN     = 120   # input sequence length in snapshots
 TRAIN_RATIO = 0.70
 CAL_RATIO   = 0.15  # calibration set for HopCPT, test set is whatever remains
+
+# On-chain feature settings (Alchemy)
+# Network follows the pattern: https://{network}.g.alchemy.com/v2/{key}
+# User must enable the target network in their Alchemy dashboard first.
+#
+# On-chain features are global market-state columns, not per-pair.
+# They are joined on timestamp so every row (regardless of pair) shares
+# the same ETH chain values at that moment in time.
+ONCHAIN_SYMBOL = "ETHUSDT"   # subdirectory name / filename prefix in onchain_data/
+
+# Canonical column list — single source of truth shared with data_pipeline.py.
+from data_collection.onchain_utils import ONCHAIN_FEATURE_COLUMNS  # noqa: E402

@@ -1,10 +1,17 @@
 import glob
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-import book_depth_utils
+# Allow imports from the project root (data_collection, config)
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from data_collection import book_depth_utils                          # noqa: E402
+from data_collection.onchain_utils import ONCHAIN_FEATURE_COLUMNS    # noqa: E402
 
 
 # Fetching and merging, this file is the main data processing pipeline. Produces the cleaned/feature-engineered CSV ready for modelling.
@@ -165,6 +172,61 @@ def engineer_features(
     return df
 
 
+# ── On-chain merge ────────────────────────────────────────────────────────────
+
+def merge_onchain(
+    df: pd.DataFrame,
+    onchain_base: str = "onchain_data",
+    symbol: str = "ETHUSDT",
+) -> pd.DataFrame:
+    """Join on-chain features into the feature DataFrame on timestamp.
+
+    On-chain features are global market-state columns — not per-pair.
+    Every row (BTCUSDT and ETHUSDT alike) receives the same ETH chain
+    values for that moment in time.  No zero-filling is needed because
+    the join is by timestamp, not by pair.
+
+    Gaps between 30-second snapshots and ~12-second block times are
+    closed with forward-fill (gas price does not suddenly drop to zero
+    between blocks), with a trailing back-fill for the session open.
+
+    Returns df unchanged with a warning if no on-chain data is found.
+    """
+    onchain_dir = Path(onchain_base) / symbol
+    daily_files = sorted(glob.glob(str(onchain_dir / f"{symbol}-onchain-*.csv")))
+
+    if not daily_files:
+        print(f"  [onchain] no data found under {onchain_dir} — skipping merge")
+        return df
+
+    onchain = pd.concat(
+        [pd.read_csv(f) for f in daily_files], ignore_index=True
+    )
+
+    # Convert Unix-ms to naive UTC datetime to match the main df timestamp column
+    onchain["timestamp"] = pd.to_datetime(onchain["timestamp_ms"], unit="ms")
+    onchain = (
+        onchain[["timestamp"] + ONCHAIN_FEATURE_COLUMNS]
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp")
+        .reset_index(drop=True)
+    )
+
+    df = df.copy()
+    df = df.merge(onchain, on="timestamp", how="left")
+
+    # Forward-fill then back-fill so no NaNs remain at either end of the series
+    df[ONCHAIN_FEATURE_COLUMNS] = (
+        df[ONCHAIN_FEATURE_COLUMNS].ffill().bfill()
+    )
+
+    print(
+        f"  [onchain] merged {len(daily_files)} daily files — "
+        f"{len(ONCHAIN_FEATURE_COLUMNS)} global features added"
+    )
+    return df
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def infer_pairs(df: pd.DataFrame) -> list:
@@ -191,11 +253,16 @@ def run_pipeline(
     out_base: str = "bookDepth_data",
     roll_window: int = 60,
     regime_window: int = 240,
+    onchain_base: str = "onchain_data",
+    onchain_symbol: str = "ETHUSDT",
 ) -> pd.DataFrame:
-    """Full pipeline: fetch → merge → pivot → feature engineering.
+    """Full pipeline: fetch → merge → pivot → feature engineering → on-chain merge.
 
     For historical runs use e.g. period="7d".
     For live daily updates call with period="1d" (or yesterday's date "YYYY-MM-DD").
+
+    On-chain data is merged last as global market-state columns shared across
+    all pairs.  The step is skipped gracefully if no on-chain CSVs are present.
 
     Returns the feature-engineered DataFrame ready for modelling.
     """
@@ -213,8 +280,11 @@ def run_pipeline(
 
     print("[pipeline] engineering features...")
     features = engineer_features(cleaned, trading_pairs, roll_window, regime_window)
-    print(f"[pipeline] done  rows={len(features)}  cols={len(features.columns)}")
 
+    print("[pipeline] merging on-chain features...")
+    features = merge_onchain(features, onchain_base=onchain_base, symbol=onchain_symbol)
+
+    print(f"[pipeline] done  rows={len(features)}  cols={len(features.columns)}")
     return features
 
 

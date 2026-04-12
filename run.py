@@ -12,7 +12,7 @@ from config import (
     DEFAULT_PAIRS, DEFAULT_PERIOD, SEQ_LEN,
     ALL_PAIRS_TRADES, ALL_PAIRS_LABELED,
     CRASH_HORIZON, CRASH_SIGMA,
-    BOOK_DEPTH_DIR, TRADES_DIR,
+    BOOK_DEPTH_DIR, TRADES_DIR, ONCHAIN_DIR, ONCHAIN_SYMBOL,
 )
 
 
@@ -154,14 +154,35 @@ def step_download(pairs, period):
             Path(f).unlink()
         print(f"  [{pair}] merged {len(all_files)} daily trade files -> {out_path.name}")
 
+    # On-chain (Alchemy) — optional; skipped gracefully if key not set
+    try:
+        from data_collection.onchain_utils import AlchemyClient, download_onchain_range
+        client = AlchemyClient.from_env()
+        print(f"  Downloading on-chain data for {ONCHAIN_SYMBOL} over {period} ...")
+        oc_summary = download_onchain_range(
+            period, out_base=str(ONCHAIN_DIR), symbol=ONCHAIN_SYMBOL, client=client
+        )
+        print(
+            f"  On-chain — downloaded: {oc_summary['downloaded']}, "
+            f"skipped: {oc_summary['skipped']}, errors: {oc_summary['errors']}"
+        )
+    except EnvironmentError as e:
+        print(f"  [SKIP] On-chain download — {e}")
+
     print("  Download step complete.")
 
 
-def step_extract():
+def step_extract(pairs, period):
     print("\n\u2550\u2550\u2550 Step 2/3: Feature extraction \u2550\u2550\u2550")
     from feature_extraction.data_pipeline import run_pipeline
     print("  Running feature extraction pipeline ...")
-    run_pipeline()
+    run_pipeline(
+        trading_pairs=pairs,
+        period=period,
+        out_base=str(BOOK_DEPTH_DIR),
+        onchain_base=str(ONCHAIN_DIR),
+        onchain_symbol=ONCHAIN_SYMBOL,
+    )
     print("  Feature extraction complete.")
 
 
@@ -287,7 +308,7 @@ def main():
             print("\n[SKIP] Data download")
 
         if not args.skip_extract:
-            step_extract()
+            step_extract(pairs, period)
         else:
             print("\n[SKIP] Feature extraction")
 
