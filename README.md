@@ -33,7 +33,6 @@ python data_pipeline.py
 
 - Use immediate `T` vs `T-1` deltas for “impact” features.
 - Use rolling windows (e.g. 60 and 240 minutes) for regime normalization.
-- Keep ratio/z-score features; drop raw totals before model input.
 
 ## Example Python usage
 
