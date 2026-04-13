@@ -36,3 +36,10 @@ ONCHAIN_SYMBOL = "ETHUSDT"   # subdirectory name / filename prefix in onchain_da
 
 # Canonical column list — single source of truth shared with data_pipeline.py.
 from data_collection.onchain_utils import ONCHAIN_FEATURE_COLUMNS  # noqa: E402
+
+# ── Live production ────────────────────────────────────────────────────────────
+LIVE_WINDOW_DAYS       = 30    # rolling training window kept in SnapshotBuffer
+RETRAIN_INTERVAL_HOURS = 24    # how often the Trainer retrains on the rolling window
+LIVE_WARMUP_SNAPSHOTS  = SEQ_LEN  # min rows before first prediction (= 120)
+
+BINANCE_WS_BASE = "wss://fstream.binance.com/stream"  # futures combined stream
