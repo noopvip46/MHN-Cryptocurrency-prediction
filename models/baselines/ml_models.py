@@ -2,6 +2,9 @@
 # BaseFlashCrashModel interface so they slot into the same pipeline as the deep models.
 # All three handle class imbalance internally.
 # Input must be flattened — use SequenceDataset.get_flat_splits() to get the right format.
+#
+# GPU support: only XGBoost benefits from device="cuda".  Random Forest and Logistic
+# Regression are sklearn models and always run on CPU regardless of the device flag.
 
 from __future__ import annotations
 
@@ -14,20 +17,25 @@ from models.base import BaseFlashCrashModel
 # XGBoost is optional so we can import the module even without it installed;
 # the error is only raised when you actually try to construct an xgboost model.
 try:
+    import xgboost as _xgb
     from xgboost import XGBClassifier as _XGBClassifier
     _XGBOOST_AVAILABLE = True
+    # XGBoost 2.0 unified the GPU API: device="cuda" replaces tree_method="gpu_hist".
+    _XGB_VERSION = tuple(int(x) for x in _xgb.__version__.split(".")[:2])
 except ImportError:
     _XGBOOST_AVAILABLE = False
+    _XGB_VERSION = (0, 0)
 
 _VALID_TYPES = ("xgboost", "random_forest", "logistic")
 
 
 class MLBaselinesModel(BaseFlashCrashModel):
 
-    def __init__(self, model_type="xgboost", **kwargs):
+    def __init__(self, model_type="xgboost", device="cpu", **kwargs):
         if model_type not in _VALID_TYPES:
             raise ValueError(f"model_type must be one of {_VALID_TYPES}, got {model_type!r}")
         self.model_type   = model_type
+        self.device       = device   # only used by XGBoost; RF and LR always run on CPU
         self.kwargs       = kwargs
         self.name         = f"baseline_{model_type}"
         self._model       = None
@@ -50,6 +58,17 @@ class MLBaselinesModel(BaseFlashCrashModel):
                 verbosity=0,
                 random_state=42,
             )
+            # GPU acceleration — XGBoost 2.0+ uses device="cuda"; older uses tree_method="gpu_hist"
+            if self.device == "cuda":
+                if _XGB_VERSION >= (2, 0):
+                    defaults["device"] = "cuda"
+                else:
+                    defaults["tree_method"] = "gpu_hist"
+                    defaults["gpu_id"]      = 0
+                print(f"  [{self.name}] using XGBoost GPU  (version {'.'.join(str(x) for x in _XGB_VERSION)})")
+            else:
+                print(f"  [{self.name}] using XGBoost CPU  (pass --device cuda to use GPU)")
+
             defaults.update(self.kwargs)
             try:
                 return _XGBClassifier(**defaults)

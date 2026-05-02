@@ -131,6 +131,7 @@ class TransformerFlashCrashModel(BaseFlashCrashModel):
         loader = DataLoader(
             WindowDataset(X_train, y_train),
             batch_size=self.batch_size, shuffle=True, drop_last=False,
+            num_workers=2, pin_memory=(self.device.type == "cuda"),
         )
 
         self._last_epoch = start_epoch - 1

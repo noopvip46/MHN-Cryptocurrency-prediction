@@ -130,7 +130,14 @@ def engineer_features(
         # ── T vs T-1 deltas ────────────────────────────────────────────────────
         df[f"{pair}_depth_imbalance_ratio_delta"]    = df[f"{pair}_depth_imbalance_ratio"].diff()
         df[f"{pair}_notional_imbalance_ratio_delta"] = df[f"{pair}_notional_imbalance_ratio"].diff()
-        df[f"{pair}_total_notional_delta"]           = total_notional.diff()
+
+        # total_notional_delta: z-score the raw dollar change so it lives on the
+        # same scale as all other features.  The raw diff is in billions of USD
+        # and would dominate gradient updates.
+        raw_delta      = total_notional.diff()
+        delta_mean     = raw_delta.rolling(roll_window,   min_periods=1).mean()
+        delta_std      = raw_delta.rolling(roll_window,   min_periods=1).std().replace(0, np.nan)
+        df[f"{pair}_total_notional_delta_z"] = (raw_delta - delta_mean) / delta_std
 
         # ── Rolling z-score normalisation ──────────────────────────────────────
         log_notional = np.log1p(total_notional)

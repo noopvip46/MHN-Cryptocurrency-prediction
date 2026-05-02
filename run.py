@@ -231,9 +231,9 @@ def step_train(model_name, seq_len, epochs, alpha, use_conformal, device,
         "stanhop":     lambda: STanHopModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
         "lstm":        lambda: LSTMFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
         "transformer": lambda: TransformerFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "xgboost":     lambda: MLBaselinesModel("xgboost"),
-        "random_forest": lambda: MLBaselinesModel("random_forest"),
-        "logistic":    lambda: MLBaselinesModel("logistic"),
+        "xgboost":     lambda: MLBaselinesModel("xgboost",       device=device),
+        "random_forest": lambda: MLBaselinesModel("random_forest", device=device),
+        "logistic":    lambda: MLBaselinesModel("logistic",      device=device),
     }
 
     model = MODEL_MAP[model_name]()

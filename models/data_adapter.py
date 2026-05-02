@@ -83,9 +83,15 @@ class SequenceDataset:
             available = [c for c in df.columns if c.endswith("_flash_crash_label")]
             raise KeyError(f"Label column '{label_col}' not found. Available label columns: {available}")
 
-        # Separate features from labels and timestamp
-        label_cols_all = [c for c in df.columns if c.endswith("_flash_crash_label")]
-        drop_cols = ["timestamp"] + label_cols_all
+        # Separate features from labels and timestamp.
+        # vwap_volatility is kept in the CSV for the label step (label threshold
+        # = -CRASH_SIGMA × vwap_volatility × √CRASH_HORIZON) but must NOT be fed
+        # to the model — it was used to normalise the crash threshold, so including
+        # it would give the model a direct hint about how the label was generated
+        # rather than forcing it to learn genuine crash precursors.
+        label_cols_all    = [c for c in df.columns if c.endswith("_flash_crash_label")]
+        vwap_vol_cols     = [c for c in df.columns if c.endswith("_vwap_volatility")]
+        drop_cols = ["timestamp"] + label_cols_all + vwap_vol_cols
         feature_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
         # Forward-fill then back-fill NaNs — book depth snapshots can have small gaps
