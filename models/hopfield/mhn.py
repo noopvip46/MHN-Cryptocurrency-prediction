@@ -215,6 +215,7 @@ class MHNFlashCrashModel(BaseFlashCrashModel):
     def predict_proba(self, X):
         if self._net is None:
             raise RuntimeError("Model not trained. Call fit() first.")
+        was_training = self._net.training
         self._net.eval()
         all_probs = []
         with torch.no_grad():
@@ -223,4 +224,6 @@ class MHNFlashCrashModel(BaseFlashCrashModel):
                     np.ascontiguousarray(X[start : start + self.batch_size])
                 ).to(self.device)
                 all_probs.append(torch.sigmoid(self._net(batch)).cpu().numpy())
+        if was_training:
+            self._net.train()
         return np.concatenate(all_probs, axis=0)

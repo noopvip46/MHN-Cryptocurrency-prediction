@@ -183,6 +183,11 @@ class LSTMFlashCrashModel(BaseFlashCrashModel):
     def predict_proba(self, X):
         if self._net is None:
             raise RuntimeError("Model not trained. Call fit() first.")
+        # Save and restore training mode so calling predict_proba mid-training
+        # (e.g. from evaluate() inside the epoch loop) does not leave the network
+        # in eval mode and corrupt subsequent gradient steps.  For cuDNN RNNs this
+        # is a hard error; for other layers it is a silent bug (wrong dropout/BN).
+        was_training = self._net.training
         self._net.eval()
         all_probs = []
         with torch.no_grad():
@@ -191,4 +196,6 @@ class LSTMFlashCrashModel(BaseFlashCrashModel):
                     np.ascontiguousarray(X[start : start + self.batch_size])
                 ).to(self.device)
                 all_probs.append(torch.sigmoid(self._net(batch)).cpu().numpy())
+        if was_training:
+            self._net.train()
         return np.concatenate(all_probs, axis=0)
