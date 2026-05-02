@@ -131,9 +131,25 @@ python run.py --skip-download --skip-extract --skip-label --model stanhop \
 
 # Memory-only pipeline — no intermediate CSVs, only all_pairs_labeled.csv written
 python run.py --no-onchain --no-save --model stanhop
+
+# Custom hyperparameters
+python run.py --skip-download --skip-extract --skip-label --model stanhop \
+    --hidden-dim 256 --n-heads 8 --top-k 20 --dropout 0.2 --lr 5e-4 --batch-size 512
+
+python run.py --skip-download --skip-extract --skip-label --model lstm \
+    --hidden-dim 256 --n-layers 3 --dropout 0.3 --lr 5e-4
+
+python run.py --skip-download --skip-extract --skip-label --model xgboost --device cuda \
+    --xgb-max-depth 4 --xgb-lr 0.02 --xgb-n-estimators 1000 --xgb-early-stopping 50
+
+# Run on a colleague's dataset with different pair names
+python run.py --skip-download --skip-extract --skip-label \
+    --data-file /path/to/their_labeled.csv --label-pair SOLUSDT --model stanhop --no-conformal
 ```
 
 ### All flags
+
+**Pipeline control**
 
 | Flag | Default | Description |
 |---|---|---|
@@ -152,6 +168,36 @@ python run.py --no-onchain --no-save --model stanhop
 | `--checkpoint-dir` | `checkpoints/` | Directory for per-epoch DL training checkpoints |
 | `--resume` | none | Path to a `.pt` checkpoint — resumes training from that epoch |
 | `--device` | `auto` | Compute device: `cpu`, `cuda`, or `auto` |
+| `--data-file` | none | Path to a pre-built labeled CSV — skips download/extract/label entirely |
+| `--label-pair` | `BTCUSDT` | Pair name whose `_flash_crash_label` column is the prediction target |
+
+**Hyperparameters — shared DL** (apply to MHN, STanHop, LSTM, Transformer)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--hidden-dim` | `128` | Hidden / model dimension |
+| `--n-heads` | `4` | Number of attention heads |
+| `--n-layers` | `2` (LSTM) / `3` (Transformer) | Number of stacked layers |
+| `--dropout` | `0.2` (LSTM) / `0.1` (others) | Dropout rate |
+| `--lr` | `1e-3` | AdamW learning rate |
+| `--batch-size` | `256` | Mini-batch size |
+
+**Hyperparameters — model-specific**
+
+| Flag | Default | Applies to | Description |
+|---|---|---|---|
+| `--top-k` | `10` | STanHop | Sparse attention — keep top-k scores per query |
+| `--n-patterns` | `64` | MHN | Number of learnable memory patterns |
+| `--dim-feedforward` | `256` | Transformer | Feedforward dimension inside each encoder layer |
+
+**Hyperparameters — XGBoost**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--xgb-n-estimators` | `500` | Max trees — early stopping usually cuts this short |
+| `--xgb-max-depth` | `6` | Maximum tree depth |
+| `--xgb-lr` | `0.05` | Learning rate / eta |
+| `--xgb-early-stopping` | `30` | Stop after N rounds without val improvement |
 
 ### Pipeline steps
 

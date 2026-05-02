@@ -63,6 +63,38 @@ def parse_args():
     p.add_argument("--resume",  default=None,
                    help="Path to a .pt checkpoint file — resumes DL training from that epoch")
 
+    # ── Hyperparameters — shared DL ───────────────────────────────────────────
+    p.add_argument("--hidden-dim",      type=int,   default=128,
+                   help="Hidden/model dimension for all DL models  (default: 128)")
+    p.add_argument("--n-heads",         type=int,   default=4,
+                   help="Number of attention heads  (default: 4)")
+    p.add_argument("--n-layers",        type=int,   default=None,
+                   help="Number of stacked layers — LSTM default 2, Transformer default 3")
+    p.add_argument("--dropout",         type=float, default=None,
+                   help="Dropout rate — LSTM default 0.2, others default 0.1")
+    p.add_argument("--lr",              type=float, default=1e-3,
+                   help="Learning rate for DL optimiser  (default: 1e-3)")
+    p.add_argument("--batch-size",      type=int,   default=256,
+                   help="Mini-batch size for DL training  (default: 256)")
+
+    # ── Hyperparameters — model-specific ──────────────────────────────────────
+    p.add_argument("--top-k",           type=int,   default=10,
+                   help="[STanHop] sparse attention top-k per query  (default: 10)")
+    p.add_argument("--n-patterns",      type=int,   default=64,
+                   help="[MHN] number of learnable memory patterns  (default: 64)")
+    p.add_argument("--dim-feedforward", type=int,   default=256,
+                   help="[Transformer] feedforward dim inside each encoder layer  (default: 256)")
+
+    # ── Hyperparameters — XGBoost ─────────────────────────────────────────────
+    p.add_argument("--xgb-n-estimators",    type=int,   default=500,
+                   help="[XGBoost] max trees (early stopping usually cuts this short)  (default: 500)")
+    p.add_argument("--xgb-max-depth",       type=int,   default=6,
+                   help="[XGBoost] max tree depth  (default: 6)")
+    p.add_argument("--xgb-lr",              type=float, default=0.05,
+                   help="[XGBoost] learning rate / eta  (default: 0.05)")
+    p.add_argument("--xgb-early-stopping",  type=int,   default=30,
+                   help="[XGBoost] stop after N rounds without val improvement  (default: 30)")
+
     # External dataset support
     p.add_argument("--data-file",   default=None,
                    help="Path to a pre-built labeled CSV (skips download/extract/label). "
@@ -214,7 +246,8 @@ def resolve_device(arg):
 
 
 def step_train(model_name, seq_len, epochs, alpha, use_conformal, device,
-               checkpoint_dir=None, resume_from=None, data_file=None, label_pair=None):
+               checkpoint_dir=None, resume_from=None, data_file=None, label_pair=None,
+               hparams=None):
     print(f"\n{SEP}")
     print(f"  Step 4/4 — Train ({model_name})  device={device}")
     print(SEP)
@@ -238,14 +271,54 @@ def step_train(model_name, seq_len, epochs, alpha, use_conformal, device,
     ML_MODELS = {"xgboost", "random_forest", "logistic"}
     is_ml     = model_name in ML_MODELS
 
+    hp = hparams or {}   # dict of overrides; absent keys fall back to model defaults
+
     MODEL_MAP = {
-        "mhn":         lambda: MHNFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "stanhop":     lambda: STanHopModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "lstm":        lambda: LSTMFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "transformer": lambda: TransformerFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "xgboost":     lambda: MLBaselinesModel("xgboost",       device=device),
+        "mhn": lambda: MHNFlashCrashModel(
+            seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device,
+            hidden_dim        = hp.get("hidden_dim", 128),
+            n_heads           = hp.get("n_heads",    4),
+            n_memory_patterns = hp.get("n_patterns", 64),
+            dropout           = hp.get("dropout",    0.1),
+            lr                = hp.get("lr",         1e-3),
+            batch_size        = hp.get("batch_size", 256),
+        ),
+        "stanhop": lambda: STanHopModel(
+            seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device,
+            hidden_dim = hp.get("hidden_dim", 128),
+            n_heads    = hp.get("n_heads",    4),
+            top_k      = hp.get("top_k",      10),
+            dropout    = hp.get("dropout",    0.1),
+            lr         = hp.get("lr",         1e-3),
+            batch_size = hp.get("batch_size", 256),
+        ),
+        "lstm": lambda: LSTMFlashCrashModel(
+            seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device,
+            hidden_dim   = hp.get("hidden_dim", 128),
+            n_layers     = hp.get("n_layers",   2),
+            dropout      = hp.get("dropout",    0.2),
+            lr           = hp.get("lr",         1e-3),
+            batch_size   = hp.get("batch_size", 256),
+        ),
+        "transformer": lambda: TransformerFlashCrashModel(
+            seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device,
+            d_model         = hp.get("hidden_dim",      128),
+            n_heads         = hp.get("n_heads",          4),
+            n_layers        = hp.get("n_layers",         3),
+            dim_feedforward = hp.get("dim_feedforward", 256),
+            dropout         = hp.get("dropout",         0.1),
+            lr              = hp.get("lr",              1e-3),
+            batch_size      = hp.get("batch_size",      256),
+        ),
+        "xgboost": lambda: MLBaselinesModel(
+            "xgboost", device=device,
+            n_estimators        = hp.get("xgb_n_estimators",   500),
+            max_depth           = hp.get("xgb_max_depth",       6),
+            learning_rate       = hp.get("xgb_lr",              0.05),
+            early_stopping_rounds = hp.get("xgb_early_stopping", 30),
+        ),
         "random_forest": lambda: MLBaselinesModel("random_forest", device=device),
-        "logistic":    lambda: MLBaselinesModel("logistic",      device=device),
+        "logistic":      lambda: MLBaselinesModel("logistic",      device=device),
     }
 
     model = MODEL_MAP[model_name]()
@@ -378,6 +451,21 @@ def main():
             resume_from     = args.resume,
             data_file       = args.data_file,
             label_pair      = args.label_pair,
+            hparams         = {
+                "hidden_dim":        args.hidden_dim,
+                "n_heads":           args.n_heads,
+                "n_layers":          args.n_layers,
+                "dropout":           args.dropout,
+                "lr":                args.lr,
+                "batch_size":        args.batch_size,
+                "top_k":             args.top_k,
+                "n_patterns":        args.n_patterns,
+                "dim_feedforward":   args.dim_feedforward,
+                "xgb_n_estimators":  args.xgb_n_estimators,
+                "xgb_max_depth":     args.xgb_max_depth,
+                "xgb_lr":            args.xgb_lr,
+                "xgb_early_stopping": args.xgb_early_stopping,
+            },
         )
         print_summary(metrics, args.model)
         print(f"\n  Total time: {time.time()-t_total:.0f}s")
