@@ -101,9 +101,13 @@ class MLBaselinesModel(BaseFlashCrashModel):
         self._model = self._build_model(pos_weight)
 
         if self.model_type == "xgboost" and X_val is not None and y_val is not None:
-            self._model.fit(X_train, y_train,
-                            eval_set=[(np.asarray(X_val, dtype=np.float32), np.asarray(y_val, dtype=int))],
-                            verbose=False)
+            self._model.fit(
+                X_train, y_train,
+                eval_set=[(np.asarray(X_val, dtype=np.float32), np.asarray(y_val, dtype=int))],
+                verbose=10,   # print aucpr on val set every 10 trees
+            )
+        elif self.model_type == "xgboost":
+            self._model.fit(X_train, y_train, verbose=10)
         else:
             self._model.fit(X_train, y_train)
 

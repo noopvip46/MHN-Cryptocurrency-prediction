@@ -271,7 +271,11 @@ def step_train(model_name, seq_len, epochs, alpha, use_conformal, device,
                 print(f"  [NOTE] HopCPT skipped for ML baseline '{model_name}'")
             print(f"  Training ...")
             t0 = time.time()
-            model.fit(X_tr, y_tr, **dl_kwargs)
+            if is_ml:
+                # Always pass val split so XGBoost can report eval metrics during training
+                model.fit(X_tr, y_tr, X_val=X_cal, y_val=y_cal)
+            else:
+                model.fit(X_tr, y_tr, X_val=X_cal, y_val=y_cal, **dl_kwargs)
             print(f"  Training done in {time.time()-t0:.0f}s")
             metrics = model.evaluate(X_te, y_te)
 

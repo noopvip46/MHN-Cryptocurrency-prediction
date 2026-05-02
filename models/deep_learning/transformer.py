@@ -155,12 +155,12 @@ class TransformerFlashCrashModel(BaseFlashCrashModel):
                 if ckpt_dir:
                     _save_checkpoint(epoch)
 
-                if epoch % 10 == 0 or epoch == start_epoch:
-                    msg = f"[{self.name}] epoch {epoch:>3}/{self.epochs}  loss={epoch_loss:.5f}"
-                    if X_val is not None and y_val is not None:
-                        val = self.evaluate(X_val, y_val)
-                        msg += f"  val_auc={val['roc_auc']:.4f}  val_ap={val['avg_prec']:.4f}"
-                    print(msg)
+                # Print loss every epoch; val metrics every 5 epochs (evaluate is expensive)
+                msg = f"[{self.name}] epoch {epoch:>3}/{self.epochs}  loss={epoch_loss:.5f}"
+                if X_val is not None and y_val is not None and (epoch % 5 == 0 or epoch == self.epochs):
+                    val = self.evaluate(X_val, y_val)
+                    msg += f"  val_auc={val['roc_auc']:.4f}  val_ap={val['avg_prec']:.4f}"
+                print(msg, flush=True)
 
         except KeyboardInterrupt:
             p = _save_checkpoint(self._last_epoch)
