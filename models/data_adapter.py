@@ -12,6 +12,35 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.utils.data
+
+
+class WindowDataset(torch.utils.data.Dataset):
+    """Lazy sliding-window PyTorch Dataset.
+
+    Holds only a reference to the base feature view and labels array.
+    Each window is made contiguous and converted to a tensor on demand in
+    __getitem__ — only one window (seq_len × n_features) is in memory per
+    worker at a time, not the entire training split.
+
+    RAM cost: O(T × F) for the base array, not O(N_windows × seq_len × F).
+    """
+
+    def __init__(self, X_view: np.ndarray, y: np.ndarray):
+        # X_view : (N, seq_len, F)  — may be a non-contiguous stride-tricks view
+        # y      : (N,)             — int8 labels
+        self._X = X_view
+        self._y = y
+
+    def __len__(self):
+        return len(self._y)
+
+    def __getitem__(self, idx):
+        # np.ascontiguousarray makes one window contiguous so torch can wrap it
+        x = torch.from_numpy(np.ascontiguousarray(self._X[idx]))   # (seq_len, F) float32
+        y = torch.tensor(float(self._y[idx]))
+        return x, y
 
 
 class SequenceDataset:
@@ -68,19 +97,18 @@ class SequenceDataset:
         T, F = features_arr.shape
         print(f"[SequenceDataset] raw data: {T} rows x {F} features")
 
-        # Build sliding windows: window i covers rows [i, i+seq_len), label is at row i+seq_len-1
         n_windows = T - self.seq_len + 1
         if n_windows <= 0:
             raise ValueError(f"seq_len={self.seq_len} exceeds data length {T}. Reduce seq_len or add more data.")
 
-        X = np.empty((n_windows, self.seq_len, F), dtype=np.float32)
-        y = np.empty(n_windows, dtype=np.int8)
-        for i in range(n_windows):
-            X[i] = features_arr[i : i + self.seq_len]
-            y[i] = labels_arr[i + self.seq_len - 1]
+        # sliding_window_view returns a zero-copy VIEW of shape (n_windows, seq_len, F).
+        # This avoids allocating a full (495k × 120 × 28) window array (~6.6 GB).
+        # RAM cost here is the base features_arr only (~55 MB for 6 months of 2 pairs).
+        X = np.lib.stride_tricks.sliding_window_view(features_arr, (self.seq_len, F))
+        y = labels_arr[self.seq_len - 1:]   # label for window i is at row i + seq_len - 1
 
-        self._X       = X
-        self._y       = y
+        self._X       = X          # non-contiguous view — do NOT call .astype() on the whole array
+        self._y       = y.astype(np.int8)
         self._n_train = math.floor(n_windows * self.train_ratio)
         self._n_cal   = math.floor(n_windows * self.cal_ratio)
 

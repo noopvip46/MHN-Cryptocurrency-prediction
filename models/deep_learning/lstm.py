@@ -8,9 +8,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
 from models.base import BaseFlashCrashModel
+from models.data_adapter import WindowDataset
 
 
 class AttentionPooling(nn.Module):
@@ -117,9 +118,10 @@ class LSTMFlashCrashModel(BaseFlashCrashModel):
             }, p)
             return p
 
-        X_t    = torch.from_numpy(X_train.astype(np.float32))
-        y_t    = torch.from_numpy(y_train.astype(np.float32))
-        loader = DataLoader(TensorDataset(X_t, y_t), batch_size=self.batch_size, shuffle=True, drop_last=False)
+        loader = DataLoader(
+            WindowDataset(X_train, y_train),
+            batch_size=self.batch_size, shuffle=True, drop_last=False,
+        )
 
         self._last_epoch = start_epoch - 1
         try:
@@ -181,10 +183,11 @@ class LSTMFlashCrashModel(BaseFlashCrashModel):
         if self._net is None:
             raise RuntimeError("Model not trained. Call fit() first.")
         self._net.eval()
-        X_t = torch.from_numpy(X.astype(np.float32))
         all_probs = []
         with torch.no_grad():
-            for start in range(0, len(X_t), self.batch_size):
-                batch = X_t[start : start + self.batch_size].to(self.device)
+            for start in range(0, len(X), self.batch_size):
+                batch = torch.from_numpy(
+                    np.ascontiguousarray(X[start : start + self.batch_size])
+                ).to(self.device)
                 all_probs.append(torch.sigmoid(self._net(batch)).cpu().numpy())
         return np.concatenate(all_probs, axis=0)
