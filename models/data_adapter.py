@@ -37,8 +37,9 @@ class WindowDataset(torch.utils.data.Dataset):
         return len(self._y)
 
     def __getitem__(self, idx):
-        # np.ascontiguousarray makes one window contiguous so torch can wrap it
-        x = torch.from_numpy(np.ascontiguousarray(self._X[idx]))   # (seq_len, F) float32
+        # .copy() makes one window contiguous and writable so torch can wrap it.
+        # stride_tricks views are read-only; ascontiguousarray alone doesn't fix that.
+        x = torch.from_numpy(self._X[idx].copy())   # (seq_len, F) float32
         y = torch.tensor(float(self._y[idx]))
         return x, y
 
@@ -101,10 +102,12 @@ class SequenceDataset:
         if n_windows <= 0:
             raise ValueError(f"seq_len={self.seq_len} exceeds data length {T}. Reduce seq_len or add more data.")
 
-        # sliding_window_view returns a zero-copy VIEW of shape (n_windows, seq_len, F).
+        # sliding_window_view on a 2D (T, F) array with window shape (seq_len, F) returns
+        # (n_windows, 1, seq_len, F) — the extra singleton dim mirrors the F axis being
+        # fully consumed. Squeeze it out with [:, 0] to get (n_windows, seq_len, F).
         # This avoids allocating a full (495k × 120 × 28) window array (~6.6 GB).
         # RAM cost here is the base features_arr only (~55 MB for 6 months of 2 pairs).
-        X = np.lib.stride_tricks.sliding_window_view(features_arr, (self.seq_len, F))
+        X = np.lib.stride_tricks.sliding_window_view(features_arr, (self.seq_len, F))[:, 0]
         y = labels_arr[self.seq_len - 1:]   # label for window i is at row i + seq_len - 1
 
         self._X       = X          # non-contiguous view — do NOT call .astype() on the whole array
