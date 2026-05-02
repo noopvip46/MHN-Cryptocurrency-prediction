@@ -84,6 +84,8 @@ def engineer_features(
                                    notional_imbalance_ratio_delta,
                                    total_notional_delta
       - rolling z-scores:           notional_z (short), notional_regime_z (long)
+      - top-of-book thinness:       inner_book_ratio_z, book_slope_z
+                                    (only when ±0.2% level columns are present)
 
     Raw per-level columns ({PAIR}_depth_{pct}, {PAIR}_notional_{pct}) are dropped
     after the ratios are computed — they are non-stationary (absolute market size
@@ -149,6 +151,42 @@ def engineer_features(
         regime_avg = log_notional.rolling(regime_window, min_periods=1).mean()
         regime_std = log_notional.rolling(regime_window, min_periods=1).std().replace(0, np.nan)
         df[f"{pair}_notional_regime_z"] = (log_notional - regime_avg) / regime_std
+
+        # ── Top-of-book thinness ───────────────────────────────────────────────
+        # The ±0.2% level is the closest to mid price — when market makers start
+        # withdrawing liquidity before a crash, this level empties first.
+        #
+        # inner_book_ratio_z: z-scored fraction of total book notional sitting at
+        #   the ±0.2% levels.  A sustained drop signals top-of-book withdrawal.
+        #
+        # book_slope_z: ratio of close (±0.2%) to far (±4%/±5%) notional, z-scored.
+        #   Drops when top-of-book is pulled relative to deep liquidity — the shape
+        #   of the book "flattens" at the top while staying thick far from mid.
+        close_bid = f"{pair}_notional_-0.2"
+        close_ask = f"{pair}_notional_0.2"
+        if close_bid in df.columns and close_ask in df.columns:
+            close_notional = df[close_bid] + df[close_ask]
+
+            # Inner book fraction (z-scored for stationarity)
+            inner_frac = close_notional / total_notional.replace(0, np.nan)
+            inner_mean = inner_frac.rolling(roll_window, min_periods=1).mean()
+            inner_std  = inner_frac.rolling(roll_window, min_periods=1).std().replace(0, np.nan)
+            df[f"{pair}_inner_book_ratio_z"] = (inner_frac - inner_mean) / inner_std
+
+            # Book slope: close levels vs deep levels (use -4/-5 if available)
+            outer_candidates = [
+                f"{pair}_notional_-4", f"{pair}_notional_4",
+                f"{pair}_notional_-5", f"{pair}_notional_5",
+                f"{pair}_notional_-4.0", f"{pair}_notional_4.0",
+                f"{pair}_notional_-5.0", f"{pair}_notional_5.0",
+            ]
+            outer_cols = [c for c in outer_candidates if c in df.columns]
+            if outer_cols:
+                outer_notional = df[outer_cols].sum(axis=1)
+                book_slope     = close_notional / outer_notional.replace(0, np.nan)
+                slope_mean     = book_slope.rolling(roll_window, min_periods=1).mean()
+                slope_std      = book_slope.rolling(roll_window, min_periods=1).std().replace(0, np.nan)
+                df[f"{pair}_book_slope_z"] = (book_slope - slope_mean) / slope_std
 
         # ── Drop raw non-stationary columns ────────────────────────────────────
         # Raw per-level depth/notional: absolute and non-stationary

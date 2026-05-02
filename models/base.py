@@ -9,6 +9,7 @@ from sklearn.metrics import (
     average_precision_score,
     f1_score,
     precision_score,
+    precision_recall_curve,
     recall_score,
     roc_auc_score,
 )
@@ -38,9 +39,12 @@ class BaseFlashCrashModel(ABC):
         # Compute a standard set of binary classification metrics.
         # We use average precision (area under PR curve) as the primary metric
         # since flash crash datasets are heavily imbalanced — accuracy is meaningless here.
+        #
+        # Also reports metrics at the *optimal* F1 threshold (found via PR curve sweep)
+        # rather than the meaningless 0.5 default, since for 1:50+ imbalance the right
+        # threshold is typically in the 0.05–0.20 range.
         y = np.asarray(y, dtype=int)
         probs = self.predict_proba(X)
-        preds = (probs >= 0.5).astype(int)
 
         n_pos = y.sum()
         n_neg = len(y) - n_pos
@@ -57,12 +61,30 @@ class BaseFlashCrashModel(ABC):
         except ValueError:
             avg_prec = float("nan")
 
+        # Find optimal F1 threshold via precision-recall curve sweep.
+        # precision_recall_curve returns arrays of length n_thresholds+1; the last
+        # element has no corresponding threshold (represents the "predict all positive"
+        # point) so we search only over the first n_thresholds entries.
+        try:
+            prec_arr, rec_arr, thr_arr = precision_recall_curve(y, probs)
+            # prec_arr and rec_arr have one more element than thr_arr
+            prec_t = prec_arr[:-1]
+            rec_t  = rec_arr[:-1]
+            f1_arr = 2 * prec_t * rec_t / (prec_t + rec_t + 1e-9)
+            best_i = int(f1_arr.argmax())
+            best_thr = float(thr_arr[best_i])
+        except Exception:
+            best_thr = 0.5
+
+        preds_opt = (probs >= best_thr).astype(int)
+
         return {
-            "roc_auc":   roc_auc,
-            "avg_prec":  avg_prec,
-            "f1":        f1_score(y, preds, zero_division=0),
-            "precision": precision_score(y, preds, zero_division=0),
-            "recall":    recall_score(y, preds, zero_division=0),
+            "roc_auc":        roc_auc,
+            "avg_prec":       avg_prec,
+            "opt_threshold":  best_thr,
+            "f1":             f1_score(y, preds_opt, zero_division=0),
+            "precision":      precision_score(y, preds_opt, zero_division=0),
+            "recall":         recall_score(y, preds_opt, zero_division=0),
         }
 
     def save(self, path):

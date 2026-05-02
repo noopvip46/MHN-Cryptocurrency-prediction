@@ -86,12 +86,18 @@ def parse_args():
                    help="[Transformer] feedforward dim inside each encoder layer  (default: 256)")
 
     # ── Hyperparameters — XGBoost ─────────────────────────────────────────────
-    p.add_argument("--xgb-n-estimators",    type=int,   default=500,
-                   help="[XGBoost] max trees (early stopping usually cuts this short)  (default: 500)")
-    p.add_argument("--xgb-max-depth",       type=int,   default=6,
-                   help="[XGBoost] max tree depth  (default: 6)")
+    p.add_argument("--xgb-n-estimators",    type=int,   default=1000,
+                   help="[XGBoost] max trees (early stopping usually cuts this short)  (default: 1000)")
+    p.add_argument("--xgb-max-depth",       type=int,   default=4,
+                   help="[XGBoost] max tree depth — shallower reduces overfit on rare positives  (default: 4)")
+    p.add_argument("--xgb-min-child-weight", type=int,  default=20,
+                   help="[XGBoost] min samples per leaf — prevents splits on tiny positive subsets  (default: 20)")
     p.add_argument("--xgb-lr",              type=float, default=0.05,
                    help="[XGBoost] learning rate / eta  (default: 0.05)")
+    p.add_argument("--xgb-subsample",       type=float, default=0.8,
+                   help="[XGBoost] row subsampling ratio per tree  (default: 0.8)")
+    p.add_argument("--xgb-colsample",       type=float, default=0.7,
+                   help="[XGBoost] feature subsampling ratio per tree  (default: 0.7)")
     p.add_argument("--xgb-early-stopping",  type=int,   default=30,
                    help="[XGBoost] stop after N rounds without val improvement  (default: 30)")
 
@@ -316,10 +322,13 @@ def step_train(model_name, seq_len, epochs, alpha, use_conformal, device,
         ),
         "xgboost": lambda: MLBaselinesModel(
             "xgboost", device=device,
-            n_estimators          = hp.get("xgb_n_estimators")  or 500,
-            max_depth             = hp.get("xgb_max_depth")      or 6,
-            learning_rate         = hp.get("xgb_lr")             or 0.05,
-            early_stopping_rounds = hp.get("xgb_early_stopping") or 30,
+            n_estimators          = hp.get("xgb_n_estimators")    or 1000,
+            max_depth             = hp.get("xgb_max_depth")        or 4,
+            min_child_weight      = hp.get("xgb_min_child_weight") or 20,
+            learning_rate         = hp.get("xgb_lr")               or 0.05,
+            subsample             = hp.get("xgb_subsample")        or 0.8,
+            colsample_bytree      = hp.get("xgb_colsample")        or 0.7,
+            early_stopping_rounds = hp.get("xgb_early_stopping")   or 30,
         ),
         "random_forest": lambda: MLBaselinesModel("random_forest", device=device),
         "logistic":      lambda: MLBaselinesModel("logistic",      device=device),
@@ -465,10 +474,13 @@ def main():
                 "top_k":             args.top_k,
                 "n_patterns":        args.n_patterns,
                 "dim_feedforward":   args.dim_feedforward,
-                "xgb_n_estimators":  args.xgb_n_estimators,
-                "xgb_max_depth":     args.xgb_max_depth,
-                "xgb_lr":            args.xgb_lr,
-                "xgb_early_stopping": args.xgb_early_stopping,
+                "xgb_n_estimators":    args.xgb_n_estimators,
+                "xgb_max_depth":       args.xgb_max_depth,
+                "xgb_min_child_weight": args.xgb_min_child_weight,
+                "xgb_lr":              args.xgb_lr,
+                "xgb_subsample":       args.xgb_subsample,
+                "xgb_colsample":       args.xgb_colsample,
+                "xgb_early_stopping":  args.xgb_early_stopping,
             },
         )
         print_summary(metrics, args.model)

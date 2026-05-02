@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from models.base import BaseFlashCrashModel
 from models.data_adapter import WindowDataset
+from models.losses import FocalLoss
 
 
 class LearnablePositionalEncoding(nn.Module):
@@ -97,8 +98,8 @@ class TransformerFlashCrashModel(BaseFlashCrashModel):
 
         n_pos = int(y_train.sum())
         n_neg = len(y_train) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32, device=self.device)
-        criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        alpha    = n_neg / max(n_pos + n_neg, 1)   # ≈ 0.98 for 50:1 imbalance
+        criterion = FocalLoss(alpha=alpha, gamma=2.0).to(self.device)
 
         optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
