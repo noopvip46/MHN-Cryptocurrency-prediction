@@ -65,5 +65,13 @@ class BaseFlashCrashModel(ABC):
             "recall":    recall_score(y, preds, zero_division=0),
         }
 
+    def save(self, path):
+        """Save model weights to path.  Implemented by each DL subclass."""
+        raise NotImplementedError(f"{self.name}.save() is not implemented.")
+
+    def load(self, path):
+        """Load model weights from path.  Implemented by each DL subclass."""
+        raise NotImplementedError(f"{self.name}.load() is not implemented.")
+
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name!r})"

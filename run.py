@@ -1,9 +1,10 @@
-# Main script to run the full flash crash prediction pipeline end to end.
-# Use --help to see all options.
+# Flash Crash Predictor — end-to-end offline pipeline
+# Run with --help for all options.
 
 import argparse
 import sys
 import traceback
+import time
 
 import pandas as pd
 import numpy as np
@@ -15,210 +16,200 @@ from config import (
     BOOK_DEPTH_DIR, TRADES_DIR, ONCHAIN_DIR, ONCHAIN_SYMBOL,
 )
 
+SEP = "=" * 55
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Flash Crash Predictor — end-to-end pipeline"
-    )
-    parser.add_argument(
-        "--pairs",
-        default=",".join(DEFAULT_PAIRS),
-        help="Comma-separated trading pairs (default: BTCUSDT,ETHUSDT)",
-    )
-    parser.add_argument(
-        "--period",
-        default=DEFAULT_PERIOD,
-        help="Data period e.g. 6m, 1y (default: 6m)",
-    )
-    parser.add_argument(
-        "--model",
-        default="stanhop",
-        choices=["mhn", "stanhop", "lstm", "transformer", "xgboost", "random_forest", "logistic"],
-        help="Model to train (default: stanhop)",
-    )
-    parser.add_argument(
-        "--seq-len",
-        type=int,
-        default=SEQ_LEN,
-        help=f"Input sequence length in snapshots (default: {SEQ_LEN})",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=50,
-        help="Training epochs for deep learning models (default: 50)",
-    )
-    parser.add_argument(
-        "--alpha",
-        type=float,
-        default=0.1,
-        help="HopCPT miscoverage level (default: 0.1)",
-    )
-    parser.add_argument(
-        "--skip-download",
-        action="store_true",
-        help="Skip data download step",
-    )
-    parser.add_argument(
-        "--skip-extract",
-        action="store_true",
-        help="Skip feature extraction step",
-    )
-    parser.add_argument(
-        "--skip-label",
-        action="store_true",
-        help="Skip label generation step",
-    )
-    parser.add_argument(
-        "--no-conformal",
-        action="store_true",
-        help="Do not wrap model with HopCPT conformal predictor",
-    )
-    parser.add_argument(
-        "--device",
-        default="auto",
-        choices=["cpu", "cuda", "auto"],
-        help="Compute device (default: auto)",
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Flash Crash Predictor — offline pipeline")
+
+    # Data
+    p.add_argument("--pairs",    default=",".join(DEFAULT_PAIRS),
+                   help="Comma-separated trading pairs  (default: BTCUSDT,ETHUSDT)")
+    p.add_argument("--period",   default=DEFAULT_PERIOD,
+                   help="Download period e.g. 6m, 1y, 7d  (default: 6m)")
+
+    # Model
+    p.add_argument("--model",    default="stanhop",
+                   choices=["mhn", "stanhop", "lstm", "transformer",
+                            "xgboost", "random_forest", "logistic"],
+                   help="Model architecture  (default: stanhop)")
+    p.add_argument("--seq-len",  type=int, default=SEQ_LEN,
+                   help=f"Sequence length in snapshots  (default: {SEQ_LEN})")
+    p.add_argument("--epochs",   type=int, default=50,
+                   help="Training epochs for DL models  (default: 50)")
+    p.add_argument("--alpha",    type=float, default=0.1,
+                   help="HopCPT miscoverage level  (default: 0.1)")
+
+    # Skip flags
+    p.add_argument("--skip-download",  action="store_true", help="Skip download step")
+    p.add_argument("--skip-extract",   action="store_true", help="Skip feature extraction step")
+    p.add_argument("--skip-label",     action="store_true", help="Skip label generation step")
+    p.add_argument("--no-conformal",   action="store_true", help="Disable HopCPT wrapper")
+
+    # Data flags
+    p.add_argument("--no-onchain",  action="store_true",
+                   help="Skip on-chain (Alchemy) data entirely — faster, no API key needed")
+    p.add_argument("--no-save",     action="store_true",
+                   help="Do not save intermediate CSVs — only all_pairs_labeled.csv is written. "
+                        "Incompatible with --skip-extract (no checkpoint to resume from).")
+
+    # Device
+    p.add_argument("--device",   default="auto", choices=["cpu", "cuda", "auto"],
+                   help="Compute device  (default: auto)")
+
+    # Checkpointing
+    p.add_argument("--checkpoint-dir", default="checkpoints",
+                   help="Directory to save per-epoch checkpoints during DL training  (default: checkpoints/)")
+    p.add_argument("--resume",  default=None,
+                   help="Path to a .pt checkpoint file — resumes DL training from that epoch")
+
+    return p.parse_args()
 
 
-def step_download(pairs, period):
-    print("\n\u2550\u2550\u2550 Step 1/3: Downloading data \u2550\u2550\u2550")
+# ── Step 1: Download ──────────────────────────────────────────────────────────
+
+def step_download(pairs, period, no_onchain: bool = False):
+    print(f"\n{SEP}")
+    print(f"  Step 1/4 — Download")
+    print(f"  Pairs: {pairs}   Period: {period}")
+    print(SEP)
+
     from data_collection import book_depth_utils, trades_utils
-    import glob
-    from pathlib import Path
 
-    # Book depth
-    print(f"  Downloading book depth for {pairs} over {period} ...")
-    bd_summary = book_depth_utils.download_book_depth_range(
-        pairs, period, out_base=str(BOOK_DEPTH_DIR), pause_seconds=0.15
+    # ── Book depth ────────────────────────────────────────────────────────────
+    # Downloads ZIP per day → pivots long→wide immediately → deletes raw CSV.
+    # Peak disk: one day's ZIP + raw CSV (~10 MB). Final: {PAIR}_merged.csv (~50 MB/pair).
+    print(f"\n  [1/3] Book depth")
+    t0 = time.time()
+    bd = book_depth_utils.download_book_depth_range(
+        pairs, period, out_base=str(BOOK_DEPTH_DIR), pause_seconds=0.1
     )
-    print(f"  Book depth — downloaded: {bd_summary['downloaded']}, "
-          f"missing: {bd_summary['skipped_404']}, errors: {bd_summary['errors']}")
+    print(f"  Book depth done in {time.time()-t0:.0f}s — "
+          f"ok: {bd['downloaded']}  missing: {bd['skipped_404']}  errors: {bd['errors']}")
 
-    # Merge book depth daily CSVs
-    for pair in pairs:
-        path = BOOK_DEPTH_DIR / pair
-        if not path.is_dir():
-            print(f"  [WARN] No bookDepth_data directory for {pair}")
-            continue
-        all_files = sorted(
-            f for f in glob.glob(str(path / "*.csv"))
-            if "_merged" not in Path(f).name
-        )
-        if not all_files:
-            print(f"  [WARN] No daily CSV files found for {pair}")
-            continue
-        out_path = path / f"{pair}_merged.csv"
-        first = True
-        for f in all_files:
-            chunk = pd.read_csv(f)
-            chunk.to_csv(out_path, mode="w" if first else "a", header=first, index=False)
-            first = False
-        print(f"  [{pair}] merged {len(all_files)} daily files -> {out_path.name}")
-
-    # Trades
-    print(f"  Downloading trades for {pairs} over {period} ...")
-    tr_summary = trades_utils.download_trades_range(
+    # ── Trades ────────────────────────────────────────────────────────────────
+    # Downloads ZIP per day → aggregates ~500 MB raw CSV to 30 s bins (~100 KB) → deletes raw.
+    # Peak disk: one day's ZIP + raw CSV (~600 MB). Final: {PAIR}_trades_agg.csv (~20 MB/pair).
+    print(f"\n  [2/3] Trades")
+    t0 = time.time()
+    tr = trades_utils.download_trades_range(
         pairs, period, out_base=str(TRADES_DIR), pause_seconds=0.15
     )
-    print(f"  Trades — downloaded: {tr_summary['downloaded']}, "
-          f"missing: {tr_summary['skipped_404']}, errors: {tr_summary['errors']}")
+    print(f"  Trades done in {time.time()-t0:.0f}s — "
+          f"ok: {tr['downloaded']}  missing: {tr['skipped_404']}  errors: {tr['errors']}")
 
-    TRADE_DTYPES = {
-        "id": "int64",
-        "price": "float64",
-        "qty": "float64",
-        "quote_qty": "float64",
-        "time": "int64",
-        "is_buyer_maker": "bool",
-    }
+    # ── On-chain (optional) ───────────────────────────────────────────────────
+    if no_onchain:
+        print("\n  [3/3] On-chain skipped (--no-onchain)")
+    else:
+        print(f"\n  [3/3] On-chain (Alchemy)")
+        try:
+            from data_collection.onchain_utils import AlchemyClient, download_onchain_range
+            client = AlchemyClient.from_env()
+            t0 = time.time()
+            oc = download_onchain_range(
+                period, out_base=str(ONCHAIN_DIR), symbol=ONCHAIN_SYMBOL, client=client
+            )
+            print(f"  On-chain done in {time.time()-t0:.0f}s — "
+                  f"ok: {oc['downloaded']}  skipped: {oc['skipped']}  errors: {oc['errors']}")
+        except EnvironmentError as e:
+            print(f"  [SKIP] On-chain — {e}")
+            print("  Tip: set ALCHEMY_API_KEY in .env or use --no-onchain to suppress this warning.")
 
-    # Merge trade daily CSVs
-    for pair in pairs:
-        path = TRADES_DIR / pair
-        if not path.is_dir():
-            print(f"  [WARN] No trades_data directory for {pair}")
-            continue
-        all_files = sorted(glob.glob(str(path / f"{pair}-trades-*.csv")))
-        if not all_files:
-            print(f"  [WARN] No daily trade CSVs found for {pair}")
-            continue
-        out_path = path / f"{pair}_trades_merged.csv"
-        first = True
-        for f in all_files:
-            chunk = pd.read_csv(f, dtype=TRADE_DTYPES)
-            chunk.to_csv(out_path, mode="w" if first else "a", header=first, index=False)
-            first = False
-            Path(f).unlink()
-        print(f"  [{pair}] merged {len(all_files)} daily trade files -> {out_path.name}")
-
-    # On-chain (Alchemy) — optional; skipped gracefully if key not set
-    try:
-        from data_collection.onchain_utils import AlchemyClient, download_onchain_range
-        client = AlchemyClient.from_env()
-        print(f"  Downloading on-chain data for {ONCHAIN_SYMBOL} over {period} ...")
-        oc_summary = download_onchain_range(
-            period, out_base=str(ONCHAIN_DIR), symbol=ONCHAIN_SYMBOL, client=client
-        )
-        print(
-            f"  On-chain — downloaded: {oc_summary['downloaded']}, "
-            f"skipped: {oc_summary['skipped']}, errors: {oc_summary['errors']}"
-        )
-    except EnvironmentError as e:
-        print(f"  [SKIP] On-chain download — {e}")
-
-    print("  Download step complete.")
+    print(f"\n  Download complete.")
 
 
-def step_extract(pairs, period):
-    print("\n\u2550\u2550\u2550 Step 2/3: Feature extraction \u2550\u2550\u2550")
+# ── Step 2: Feature extraction ────────────────────────────────────────────────
+
+def step_extract(pairs, no_onchain: bool = False, save_intermediates: bool = False):
+    print(f"\n{SEP}")
+    print(f"  Step 2/4 — Feature extraction")
+    print(SEP)
+
+    if save_intermediates:
+        print("  [INFO] --save-intermediates: will write all_pairs_cleaned.csv "
+              "and all_pairs_with_trades.csv")
+
     from feature_extraction.data_pipeline import run_pipeline
-    print("  Running feature extraction pipeline ...")
+    t0 = time.time()
     run_pipeline(
-        trading_pairs=pairs,
-        period=period,
-        out_base=str(BOOK_DEPTH_DIR),
-        onchain_base=str(ONCHAIN_DIR),
-        onchain_symbol=ONCHAIN_SYMBOL,
+        trading_pairs      = pairs,
+        out_base           = str(BOOK_DEPTH_DIR),
+        trades_base        = str(TRADES_DIR),
+        onchain_base       = str(ONCHAIN_DIR),
+        onchain_symbol     = ONCHAIN_SYMBOL,
+        skip_onchain       = no_onchain,
+        save_intermediates = save_intermediates,
     )
-    print("  Feature extraction complete.")
+    print(f"  Feature extraction complete in {time.time()-t0:.0f}s.")
 
 
-def step_label(pairs):
-    print("\n\u2550\u2550\u2550 Step 2b: Label generation \u2550\u2550\u2550")
-    df = pd.read_csv(ALL_PAIRS_TRADES, parse_dates=["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
+# ── Step 3: Label generation ──────────────────────────────────────────────────
+
+def step_label(pairs, features_df=None):
+    """Generate flash crash labels.
+
+    If features_df is provided (in-memory from step_extract with --no-save),
+    labels are applied directly.  Otherwise all_pairs_with_trades.csv is read
+    from disk (requires --save-intermediates or a previous run with it).
+    """
+    print(f"\n{SEP}")
+    print(f"  Step 3/4 — Label generation")
+    print(SEP)
+
+    if features_df is not None:
+        df = features_df.sort_values("timestamp").reset_index(drop=True)
+    else:
+        if not ALL_PAIRS_TRADES.exists():
+            raise FileNotFoundError(
+                f"{ALL_PAIRS_TRADES} not found.\n"
+                "Re-run without --skip-extract, or use --save-intermediates on the extract step."
+            )
+        df = pd.read_csv(ALL_PAIRS_TRADES, parse_dates=["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
 
     for pair in pairs:
         vwap_ret = df[f"{pair}_vwap_return"]
         vwap_vol = df[f"{pair}_vwap_volatility"]
-        fwd = vwap_ret.rolling(CRASH_HORIZON).sum().shift(-CRASH_HORIZON)
-        df[f"{pair}_flash_crash_label"] = (fwd < -CRASH_SIGMA * vwap_vol).astype("Int8")
+        fwd      = vwap_ret.rolling(CRASH_HORIZON).sum().shift(-CRASH_HORIZON)
+        # Scale threshold by sqrt(CRASH_HORIZON) so both sides are on the same
+        # distributional scale.  fwd is a sum of CRASH_HORIZON iid returns, so
+        # std(fwd) = vwap_vol × sqrt(CRASH_HORIZON).  Without this factor the
+        # threshold sits at -CRASH_SIGMA/sqrt(20) ≈ -0.67 std devs of the forward
+        # distribution, labelling ~25% of rows as crashes.  With the factor, a
+        # CRASH_SIGMA=2.0 threshold sits at -2 std devs → ~2.3% crash rate.
+        threshold = -CRASH_SIGMA * vwap_vol * np.sqrt(CRASH_HORIZON)
+        df[f"{pair}_flash_crash_label"] = (fwd < threshold).astype("Int8")
 
-        n_crashes = int(df[f"{pair}_flash_crash_label"].sum())
-        pct = 100 * n_crashes / len(df)
-        print(f"  {pair}: {n_crashes} crash events flagged ({pct:.2f}%)")
+        n   = int(df[f"{pair}_flash_crash_label"].sum())
+        pct = 100 * n / len(df)
+        ratio = int((len(df) - n) / max(n, 1))
+        print(f"  {pair}: {n} crash events ({pct:.2f}%)  class ratio 1:{ratio}")
 
     df = df.iloc[:-CRASH_HORIZON].reset_index(drop=True)
     df.to_csv(ALL_PAIRS_LABELED, index=False)
-    print(f"  Labeled dataset saved: {ALL_PAIRS_LABELED}")
-    print(f"  Rows: {len(df)}, cols: {len(df.columns)}")
+    print(f"  Saved: {ALL_PAIRS_LABELED}  rows={len(df):,}  cols={len(df.columns)}")
+    return df
 
 
-def resolve_device(device_arg):
-    if device_arg == "auto":
+# ── Step 4: Train ─────────────────────────────────────────────────────────────
+
+def resolve_device(arg):
+    if arg == "auto":
         try:
             import torch
             return "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             return "cpu"
-    return device_arg
+    return arg
 
 
-def step_train(model_name, seq_len, epochs, alpha, use_conformal, device):
-    print(f"\n\u2550\u2550\u2550 Step 3/3: Training ({model_name}) \u2550\u2550\u2550")
+def step_train(model_name, seq_len, epochs, alpha, use_conformal, device,
+               checkpoint_dir=None, resume_from=None):
+    print(f"\n{SEP}")
+    print(f"  Step 4/4 — Train ({model_name})  device={device}")
+    print(SEP)
+
     from models import (
         SequenceDataset, HopCPT,
         MHNFlashCrashModel, STanHopModel,
@@ -227,22 +218,22 @@ def step_train(model_name, seq_len, epochs, alpha, use_conformal, device):
     )
     from config import LABEL_PAIR
 
-    print(f"  Loading dataset from {ALL_PAIRS_LABELED} ...")
+    print(f"  Loading {ALL_PAIRS_LABELED} ...")
     ds = SequenceDataset(str(ALL_PAIRS_LABELED), seq_len=seq_len, label_pair=LABEL_PAIR)
     ds.load()
-    print(f"  Dataset loaded: n_features={ds.n_features}")
+    print(f"  n_features={ds.n_features}  seq_len={seq_len}")
 
     ML_MODELS = {"xgboost", "random_forest", "logistic"}
-    is_ml = model_name in ML_MODELS
+    is_ml     = model_name in ML_MODELS
 
     MODEL_MAP = {
-        "mhn":           lambda: MHNFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "stanhop":       lambda: STanHopModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "lstm":          lambda: LSTMFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "transformer":   lambda: TransformerFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
-        "xgboost":       lambda: MLBaselinesModel("xgboost"),
+        "mhn":         lambda: MHNFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
+        "stanhop":     lambda: STanHopModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
+        "lstm":        lambda: LSTMFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
+        "transformer": lambda: TransformerFlashCrashModel(seq_len=seq_len, n_features=ds.n_features, epochs=epochs, device=device),
+        "xgboost":     lambda: MLBaselinesModel("xgboost"),
         "random_forest": lambda: MLBaselinesModel("random_forest"),
-        "logistic":      lambda: MLBaselinesModel("logistic"),
+        "logistic":    lambda: MLBaselinesModel("logistic"),
     }
 
     model = MODEL_MAP[model_name]()
@@ -252,81 +243,126 @@ def step_train(model_name, seq_len, epochs, alpha, use_conformal, device):
     else:
         (X_tr, y_tr), (X_cal, y_cal), (X_te, y_te) = ds.get_splits()
 
-    if use_conformal and not is_ml:
-        print(f"  Wrapping {model_name} with HopCPT (alpha={alpha}) ...")
-        cpt = HopCPT(model, alpha=alpha)
-        cpt.fit(X_tr, y_tr, X_val=X_cal, y_val=y_cal)
-        cpt.calibrate(X_cal, y_cal)
-        metrics = cpt.evaluate(X_te, y_te)
-        sets = cpt.predict_set(X_te)
-        print(f"\n  Conformal prediction set breakdown:")
-        print(f"    Crash only    (1): {(sets == 1).sum()}")
-        print(f"    No crash only (0): {(sets == 0).sum()}")
-        print(f"    Uncertain     (2): {(sets == 2).sum()}")
-        print(f"    Empty set    (-1): {(sets == -1).sum()}")
-    else:
-        if use_conformal and is_ml:
-            print(f"  [NOTE] HopCPT skipped for ML baseline model '{model_name}'")
-        print(f"  Training {model_name} ...")
-        model.fit(X_tr, y_tr)
-        metrics = model.evaluate(X_te, y_te)
+    # DL training kwargs — passed into fit() for checkpoint saving / resuming
+    dl_kwargs = {}
+    if not is_ml:
+        dl_kwargs["checkpoint_dir"] = checkpoint_dir
+        dl_kwargs["resume_from"]    = resume_from
+        if checkpoint_dir:
+            print(f"  Checkpoints → {checkpoint_dir}/  (overwritten each epoch)")
+        if resume_from:
+            print(f"  Resuming from: {resume_from}")
+
+    try:
+        if use_conformal and not is_ml:
+            print(f"  Wrapping with HopCPT (alpha={alpha}) ...")
+            cpt = HopCPT(model, alpha=alpha)
+            cpt.fit(X_tr, y_tr, X_val=X_cal, y_val=y_cal, **dl_kwargs)
+            cpt.calibrate(X_cal, y_cal)
+            metrics = cpt.evaluate(X_te, y_te)
+            sets    = cpt.predict_set(X_te)
+            print(f"  Conformal set breakdown:")
+            print(f"    Crash only    (1): {(sets == 1).sum()}")
+            print(f"    No crash only (0): {(sets == 0).sum()}")
+            print(f"    Uncertain     (2): {(sets == 2).sum()}")
+            print(f"    Empty set    (-1): {(sets == -1).sum()}")
+        else:
+            if use_conformal and is_ml:
+                print(f"  [NOTE] HopCPT skipped for ML baseline '{model_name}'")
+            print(f"  Training ...")
+            t0 = time.time()
+            model.fit(X_tr, y_tr, **dl_kwargs)
+            print(f"  Training done in {time.time()-t0:.0f}s")
+            metrics = model.evaluate(X_te, y_te)
+
+    except KeyboardInterrupt:
+        print("\n  Training stopped by user.  Checkpoint saved (see above).")
+        sys.exit(0)
 
     return metrics
 
 
 def print_summary(metrics, model_name):
-    print("\n" + "\u2550" * 60)
+    print(f"\n{SEP}")
     print(f"  Results — {model_name}")
-    print("\u2550" * 60)
+    print(SEP)
     col_w = max(len(k) for k in metrics) + 2
     for k, v in metrics.items():
         print(f"  {k:<{col_w}}: {v:.4f}")
-    print("\u2550" * 60)
+    print(SEP)
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
-    pairs = [p.strip().upper() for p in args.pairs.split(",")]
-    period = args.period
-    seq_len = args.seq_len
-    epochs = args.epochs
-    alpha = args.alpha
-    device = resolve_device(args.device)
+    args          = parse_args()
+    pairs         = [p.strip().upper() for p in args.pairs.split(",")]
+    device        = resolve_device(args.device)
     use_conformal = not args.no_conformal
+    save_inter    = not args.no_save
+
+    # Warn about incompatible flag combo
+    if args.no_save and args.skip_extract:
+        print("[WARN] --no-save + --skip-extract: no intermediate file to resume from.")
+        print("       Remove --skip-extract or add --save-intermediates on the previous run.")
 
     print(f"\nFlash Crash Predictor")
-    print(f"  Pairs:    {pairs}")
-    print(f"  Period:   {period}")
-    print(f"  Model:    {args.model}")
-    print(f"  Device:   {device}")
-    print(f"  Conformal:{use_conformal}")
+    print(f"  Pairs      : {pairs}")
+    print(f"  Period     : {args.period}")
+    print(f"  Model      : {args.model}  device={device}  conformal={use_conformal}")
+    print(f"  On-chain   : {'disabled' if args.no_onchain else 'enabled'}")
+    print(f"  Intermediates saved: {save_inter}")
+    if args.resume:
+        print(f"  Resume from: {args.resume}")
 
     try:
+        t_total = time.time()
+        features_df = None   # passed in-memory when --no-save
+
         if not args.skip_download:
-            step_download(pairs, period)
+            step_download(pairs, args.period, no_onchain=args.no_onchain)
         else:
-            print("\n[SKIP] Data download")
+            print("\n[SKIP] Download")
 
         if not args.skip_extract:
-            step_extract(pairs, period)
+            if args.no_save:
+                # Run pipeline and hold result in memory for step_label
+                from feature_extraction.data_pipeline import run_pipeline
+                from config import ALL_PAIRS_TRADES
+                print(f"\n{SEP}\n  Step 2/4 — Feature extraction (in-memory)\n{SEP}")
+                t0 = time.time()
+                features_df = run_pipeline(
+                    trading_pairs      = pairs,
+                    out_base           = str(BOOK_DEPTH_DIR),
+                    trades_base        = str(TRADES_DIR),
+                    onchain_base       = str(ONCHAIN_DIR),
+                    onchain_symbol     = ONCHAIN_SYMBOL,
+                    skip_onchain       = args.no_onchain,
+                    save_intermediates = False,
+                )
+                print(f"  Feature extraction complete in {time.time()-t0:.0f}s.")
+            else:
+                step_extract(pairs, no_onchain=args.no_onchain, save_intermediates=True)
         else:
             print("\n[SKIP] Feature extraction")
 
         if not args.skip_label:
-            step_label(pairs)
+            step_label(pairs, features_df=features_df)
         else:
             print("\n[SKIP] Label generation")
 
         metrics = step_train(
-            model_name=args.model,
-            seq_len=seq_len,
-            epochs=epochs,
-            alpha=alpha,
-            use_conformal=use_conformal,
-            device=device,
+            model_name      = args.model,
+            seq_len         = args.seq_len,
+            epochs          = args.epochs,
+            alpha           = args.alpha,
+            use_conformal   = use_conformal,
+            device          = device,
+            checkpoint_dir  = args.checkpoint_dir,
+            resume_from     = args.resume,
         )
-
         print_summary(metrics, args.model)
+        print(f"\n  Total time: {time.time()-t_total:.0f}s")
 
     except Exception:
         print("\n[ERROR] Pipeline failed:")

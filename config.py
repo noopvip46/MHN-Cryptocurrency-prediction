@@ -18,7 +18,15 @@ ROLL_WINDOW_SHORT  = 120   # snapshots (~60 min)
 ROLL_WINDOW_REGIME = 480   # snapshots (~240 min)
 
 CRASH_HORIZON = 20         # how many snapshots forward we look to define the crash label (~10 min)
-CRASH_SIGMA   = 3.0        # how many standard deviations below current volatility counts as a crash
+CRASH_SIGMA   = 2.0        # sigma threshold on the 10-min return distribution (see label formula)
+                           # The label compares the 10-min cumulative return against
+                           # -CRASH_SIGMA × vwap_volatility × sqrt(CRASH_HORIZON).
+                           # The sqrt(CRASH_HORIZON) scaling is critical — without it the threshold
+                           # is at -sigma/sqrt(20) ≈ -0.67 std devs of the forward distribution,
+                           # which flags ~25% of rows. With the scaling:
+                           #   sigma=2.0 → ~2.3% crash rate (~10k events per 6 months)
+                           #   sigma=2.5 → ~0.6% crash rate (~3k events)
+                           #   sigma=3.0 → ~0.13% crash rate (~650 events, too few for DL)
 LABEL_PAIR    = "BTCUSDT"  # primary pair we generate the label for
 
 SEQ_LEN     = 120   # input sequence length in snapshots

@@ -35,9 +35,9 @@ class HopCPT:
         self.alpha  = alpha
         self._q_hat = None  # set by calibrate()
 
-    def fit(self, X_train, y_train, X_val=None, y_val=None):
-        # Just delegates to the wrapped base model
-        self.base_model.fit(X_train, y_train, X_val, y_val)
+    def fit(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
+        # Delegates to the wrapped base model; forwards checkpoint_dir, resume_from, etc.
+        self.base_model.fit(X_train, y_train, X_val, y_val, **kwargs)
         return self
 
     def calibrate(self, X_cal, y_cal):

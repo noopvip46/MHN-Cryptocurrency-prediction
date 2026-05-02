@@ -9,6 +9,7 @@
 # Both branches are pooled and concatenated before the classification head.
 
 import math
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -132,7 +133,8 @@ class STanHopModel(BaseFlashCrashModel):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else torch.device(device)
         self._net = None
 
-    def fit(self, X_train, y_train, X_val=None, y_val=None):
+    def fit(self, X_train, y_train, X_val=None, y_val=None,
+            checkpoint_dir=None, resume_from=None):
         print(f"[{self.name}] training on {self.device}  X={X_train.shape}  pos_frac={y_train.mean():.4f}")
 
         self._net = _STanHopNet(
@@ -148,33 +150,90 @@ class STanHopModel(BaseFlashCrashModel):
         optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
 
+        start_epoch = 1
+        if resume_from is not None:
+            ckpt = torch.load(resume_from, map_location=self.device, weights_only=False)
+            self._net.load_state_dict(ckpt["state_dict"])
+            if "optimizer" in ckpt: optimizer.load_state_dict(ckpt["optimizer"])
+            if "scheduler" in ckpt: scheduler.load_state_dict(ckpt["scheduler"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            print(f"  [{self.name}] resumed from epoch {ckpt.get('epoch', '?')} → continuing from {start_epoch}")
+
+        ckpt_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        if ckpt_dir:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        def _save_checkpoint(epoch):
+            p = (ckpt_dir or Path("checkpoints")) / f"{self.name}_checkpoint.pt"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "model_name": self.name,
+                "epoch":      epoch,
+                "state_dict": self._net.state_dict(),
+                "optimizer":  optimizer.state_dict(),
+                "scheduler":  scheduler.state_dict(),
+            }, p)
+            return p
+
         X_t    = torch.from_numpy(X_train.astype(np.float32))
         y_t    = torch.from_numpy(y_train.astype(np.float32))
         loader = DataLoader(TensorDataset(X_t, y_t), batch_size=self.batch_size, shuffle=True, drop_last=False)
 
-        self._net.train()
-        for epoch in range(1, self.epochs + 1):
-            epoch_loss = 0.0
-            for X_batch, y_batch in loader:
-                X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
-                optimizer.zero_grad()
-                loss = criterion(self._net(X_batch), y_batch)
-                loss.backward()
-                nn.utils.clip_grad_norm_(self._net.parameters(), max_norm=1.0)
-                optimizer.step()
-                epoch_loss += loss.item() * len(X_batch)
+        self._last_epoch = start_epoch - 1
+        try:
+            self._net.train()
+            for epoch in range(start_epoch, self.epochs + 1):
+                epoch_loss = 0.0
+                for X_batch, y_batch in loader:
+                    X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                    optimizer.zero_grad()
+                    loss = criterion(self._net(X_batch), y_batch)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self._net.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    epoch_loss += loss.item() * len(X_batch)
 
-            scheduler.step()
-            epoch_loss /= len(X_train)
+                scheduler.step()
+                epoch_loss /= len(X_train)
+                self._last_epoch = epoch
 
-            if epoch % 10 == 0 or epoch == 1:
-                msg = f"[{self.name}] epoch {epoch:>3}/{self.epochs}  loss={epoch_loss:.5f}"
-                if X_val is not None and y_val is not None:
-                    val = self.evaluate(X_val, y_val)
-                    msg += f"  val_auc={val['roc_auc']:.4f}  val_ap={val['avg_prec']:.4f}"
-                print(msg)
+                if ckpt_dir:
+                    _save_checkpoint(epoch)
+
+                if epoch % 10 == 0 or epoch == start_epoch:
+                    msg = f"[{self.name}] epoch {epoch:>3}/{self.epochs}  loss={epoch_loss:.5f}"
+                    if X_val is not None and y_val is not None:
+                        val = self.evaluate(X_val, y_val)
+                        msg += f"  val_auc={val['roc_auc']:.4f}  val_ap={val['avg_prec']:.4f}"
+                    print(msg)
+
+        except KeyboardInterrupt:
+            p = _save_checkpoint(self._last_epoch)
+            print(f"\n  [{self.name}] interrupted at epoch {self._last_epoch} — checkpoint saved → {p}")
+            raise
 
         return self
+
+    def save(self, path):
+        """Save network weights (no optimizer state) for inference / export."""
+        if self._net is None:
+            raise RuntimeError("No trained network. Call fit() first.")
+        torch.save({
+            "model_name": self.name,
+            "epoch":      getattr(self, "_last_epoch", self.epochs),
+            "state_dict": self._net.state_dict(),
+        }, path)
+        print(f"  [{self.name}] saved → {path}")
+
+    def load(self, path):
+        """Load network weights into an already-initialised model (same hparams required)."""
+        if self._net is None:
+            raise RuntimeError("Initialise the network first by calling fit() once (even with dummy data), "
+                               "or use --resume in run.py which handles reconstruction automatically.")
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self._net.load_state_dict(ckpt["state_dict"])
+        self._last_epoch = ckpt.get("epoch", 0)
+        print(f"  [{self.name}] loaded from {path}  (epoch {self._last_epoch})")
 
     def predict_proba(self, X):
         if self._net is None:
