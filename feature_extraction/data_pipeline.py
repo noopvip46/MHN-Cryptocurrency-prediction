@@ -207,6 +207,8 @@ def _derive_trade_features(agg: pd.DataFrame, roll_window: int, regime_window: i
 
     Output keeps only stationary derived columns:
       vwap_return, vwap_volatility (label threshold only — excluded from model X),
+      vwap_return_5/10/20  (rolling cumulative returns at 2.5/5/10-min horizons),
+      vwap_vol_ratio       (short-term/long-term vol ratio — volatility acceleration),
       buy_ratio, trade_flow_imbalance,
       trade_intensity_z, trade_intensity_regime_z, trade_notional_z
 
@@ -218,6 +220,19 @@ def _derive_trade_features(agg: pd.DataFrame, roll_window: int, regime_window: i
     vwap = agg["trade_notional"] / agg["trade_volume"].replace(0, np.nan)
     agg["vwap_return"]          = vwap.pct_change()
     agg["vwap_volatility"]      = agg["vwap_return"].rolling(roll_window, min_periods=1).std()
+
+    # Multi-horizon cumulative returns — direct momentum signal.
+    # These are the past analogue of what the crash label measures forward:
+    # 5 periods ≈ 2.5 min, 10 periods ≈ 5 min, 20 periods ≈ 10 min.
+    for h in [5, 10, 20]:
+        agg[f"vwap_return_{h}"] = agg["vwap_return"].rolling(h, min_periods=1).sum()
+
+    # Volatility acceleration: short-term vol rising faster than long-term vol
+    # signals a market becoming increasingly unstable — a classic pre-crash signal.
+    vol_short = agg["vwap_return"].rolling(10,  min_periods=1).std()
+    vol_long  = agg["vwap_return"].rolling(60,  min_periods=1).std().replace(0, np.nan)
+    agg["vwap_vol_ratio"] = (vol_short / vol_long).clip(0, 10)  # clip prevents inf on cold-start rows
+
     agg["buy_ratio"]            = agg["buy_volume"] / agg["trade_volume"].replace(0, np.nan)
     agg["trade_flow_imbalance"] = (
         (agg["buy_volume"] - agg["sell_volume"]) / agg["trade_volume"].replace(0, np.nan)
@@ -393,6 +408,21 @@ def run_pipeline(
 
     print("[pipeline] adding time features...")
     features = add_time_features(features)
+
+    # Cross-pair divergence features — only meaningful when both BTC and ETH are present.
+    # BTC and ETH are highly correlated; divergence from that correlation is informative:
+    #   return spread:    BTC selling off while ETH holds → pair-specific pressure
+    #   imbalance spread: one book being drained while the other stays balanced
+    btc_ret = "BTCUSDT_vwap_return"
+    eth_ret = "ETHUSDT_vwap_return"
+    btc_imb = "BTCUSDT_depth_imbalance_ratio"
+    eth_imb = "ETHUSDT_depth_imbalance_ratio"
+    if btc_ret in features.columns and eth_ret in features.columns:
+        features["btceth_return_spread"] = features[btc_ret] - features[eth_ret]
+        print("[pipeline] added btceth_return_spread")
+    if btc_imb in features.columns and eth_imb in features.columns:
+        features["btceth_imbalance_spread"] = features[btc_imb] - features[eth_imb]
+        print("[pipeline] added btceth_imbalance_spread")
 
     # Defragment: columns were added one-by-one across the pipeline steps;
     # a single copy consolidates memory and eliminates pandas PerformanceWarning.
