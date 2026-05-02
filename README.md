@@ -142,7 +142,7 @@ python run.py --skip-download --skip-extract --skip-label --model lstm \
 python run.py --skip-download --skip-extract --skip-label --model xgboost --device cuda \
     --xgb-max-depth 4 --xgb-lr 0.02 --xgb-n-estimators 1000 --xgb-early-stopping 50
 
-# Run on a colleague's dataset with different pair names
+# Run on a other datasets with different pair names
 python run.py --skip-download --skip-extract --skip-label \
     --data-file /path/to/their_labeled.csv --label-pair SOLUSDT --model stanhop --no-conformal
 ```
