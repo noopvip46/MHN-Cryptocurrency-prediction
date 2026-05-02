@@ -63,6 +63,15 @@ def parse_args():
     p.add_argument("--resume",  default=None,
                    help="Path to a .pt checkpoint file — resumes DL training from that epoch")
 
+    # External dataset support
+    p.add_argument("--data-file",   default=None,
+                   help="Path to a pre-built labeled CSV (skips download/extract/label). "
+                        "Must contain timestamp, feature columns, and {label-pair}_flash_crash_label.")
+    p.add_argument("--label-pair",  default=None,
+                   help="Pair name whose flash_crash_label column is used as the target "
+                        "(default: LABEL_PAIR from config.py, currently BTCUSDT). "
+                        "Use this when running on a colleague's dataset with different pair names.")
+
     return p.parse_args()
 
 
@@ -205,7 +214,7 @@ def resolve_device(arg):
 
 
 def step_train(model_name, seq_len, epochs, alpha, use_conformal, device,
-               checkpoint_dir=None, resume_from=None):
+               checkpoint_dir=None, resume_from=None, data_file=None, label_pair=None):
     print(f"\n{SEP}")
     print(f"  Step 4/4 — Train ({model_name})  device={device}")
     print(SEP)
@@ -216,10 +225,13 @@ def step_train(model_name, seq_len, epochs, alpha, use_conformal, device,
         LSTMFlashCrashModel, TransformerFlashCrashModel,
         MLBaselinesModel,
     )
-    from config import LABEL_PAIR
+    from config import LABEL_PAIR as _DEFAULT_LABEL_PAIR
 
-    print(f"  Loading {ALL_PAIRS_LABELED} ...")
-    ds = SequenceDataset(str(ALL_PAIRS_LABELED), seq_len=seq_len, label_pair=LABEL_PAIR)
+    csv_path   = data_file  if data_file   else str(ALL_PAIRS_LABELED)
+    label_pair = label_pair if label_pair  else _DEFAULT_LABEL_PAIR
+
+    print(f"  Loading {csv_path}  (label_pair={label_pair}) ...")
+    ds = SequenceDataset(csv_path, seq_len=seq_len, label_pair=label_pair)
     ds.load()
     print(f"  n_features={ds.n_features}  seq_len={seq_len}")
 
@@ -364,6 +376,8 @@ def main():
             device          = device,
             checkpoint_dir  = args.checkpoint_dir,
             resume_from     = args.resume,
+            data_file       = args.data_file,
+            label_pair      = args.label_pair,
         )
         print_summary(metrics, args.model)
         print(f"\n  Total time: {time.time()-t_total:.0f}s")

@@ -63,7 +63,7 @@ class LSTMFlashCrashModel(BaseFlashCrashModel):
     name = "lstm"
 
     def __init__(self, seq_len, n_features, hidden_dim=128, n_layers=2, bidirectional=True,
-                 dropout=0.2, lr=1e-3, epochs=50, batch_size=64, device="auto"):
+                 dropout=0.2, lr=1e-3, epochs=50, batch_size=256, device="auto"):
         self.seq_len      = seq_len
         self.n_features   = n_features
         self.hidden_dim   = hidden_dim
@@ -121,7 +121,7 @@ class LSTMFlashCrashModel(BaseFlashCrashModel):
         loader = DataLoader(
             WindowDataset(X_train, y_train),
             batch_size=self.batch_size, shuffle=True, drop_last=False,
-            num_workers=2, pin_memory=(self.device.type == "cuda"),
+            num_workers=0,
         )
 
         self._last_epoch = start_epoch - 1

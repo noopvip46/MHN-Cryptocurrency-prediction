@@ -94,7 +94,7 @@ class MHNFlashCrashModel(BaseFlashCrashModel):
 
     def __init__(self, seq_len, n_features, hidden_dim=128, n_heads=4,
                  n_memory_patterns=64, dropout=0.1, lr=1e-3, epochs=50,
-                 batch_size=64, device="auto"):
+                 batch_size=256, device="auto"):
         self.seq_len           = seq_len
         self.n_features        = n_features
         self.hidden_dim        = hidden_dim
@@ -153,7 +153,7 @@ class MHNFlashCrashModel(BaseFlashCrashModel):
         loader = DataLoader(
             WindowDataset(X_train, y_train),
             batch_size=self.batch_size, shuffle=True, drop_last=False,
-            num_workers=2, pin_memory=(self.device.type == "cuda"),
+            num_workers=0,
         )
 
         self._last_epoch = start_epoch - 1

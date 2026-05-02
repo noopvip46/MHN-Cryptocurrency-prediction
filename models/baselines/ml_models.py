@@ -50,12 +50,13 @@ class MLBaselinesModel(BaseFlashCrashModel):
                 scale_pos_weight=pos_weight,
                 tree_method="hist",
                 eval_metric="aucpr",
-                n_estimators=300,
+                n_estimators=500,          # high ceiling — early stopping cuts it short
+                early_stopping_rounds=30,  # stop if aucpr doesn't improve for 30 rounds
                 max_depth=6,
                 learning_rate=0.05,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                verbosity=0,
+                verbosity=1,               # 0=silent, 1=warnings+progress
                 random_state=42,
             )
             # GPU acceleration — XGBoost 2.0+ uses device="cuda"; older uses tree_method="gpu_hist"
