@@ -17,23 +17,31 @@ SNAPSHOT_INTERVAL_S = 30   # ~30 seconds between book depth snapshots
 ROLL_WINDOW_SHORT  = 120   # snapshots (~60 min)
 ROLL_WINDOW_REGIME = 480   # snapshots (~240 min)
 
-CRASH_HORIZON = 20         # how many snapshots forward we look to define the crash label (~10 min)
-CRASH_SIGMA   = 2.75       # sigma threshold on the 10-min return distribution (see label formula)
-                           # The label compares the 10-min cumulative return against
-                           # -CRASH_SIGMA × vwap_volatility × sqrt(CRASH_HORIZON).
-                           # The sqrt(CRASH_HORIZON) scaling is critical — without it the threshold
-                           # is at -sigma/sqrt(20) ≈ -0.67 std devs of the forward distribution,
-                           # which flags ~25% of rows. With the scaling:
-                           #   sigma=2.0  → ~2.3%  crash rate (~800  distinct events per 6 months)
-                           #   sigma=2.75 → ~0.3%  crash rate (~50-100 distinct events) ← current
-                           #   sigma=3.0  → ~0.13% crash rate (~30-50 distinct events)
-                           # Each "distinct event" = ~20 consecutive labeled windows (one per 30s
-                           # within the CRASH_HORIZON look-ahead).  A genuine flash crash is a
-                           # ≥2.75σ cumulative drop over 10 min — rare enough to be research-relevant
-                           # while providing enough positive examples (~700–1 400 windows) for DL.
-LABEL_PAIR    = "BTCUSDT"  # primary pair we generate the label for
+# ── CUSUM event filter (López de Prado AFML Ch. 2) ────────────────────────────
+# Maintains running cumulative sums of upward/downward deviations in returns.
+# Triggers a spike event when either cumsum exceeds threshold h; resets after.
+CUSUM_H        = 0.015     # threshold for CUSUM trigger (1.5% cumulative deviation)
+CUSUM_EXPECTED = 0.0       # expected return (drift) subtracted before accumulation
 
-SEQ_LEN     = 120   # input sequence length in snapshots
+# ── Triple Barrier labeling (López de Prado AFML Ch. 3) ──────────────────────
+# For each spike event detected by CUSUM, we place three barriers:
+#   - take-profit (continuation): price moves further in spike direction by pt × σ
+#   - stop-loss   (reversal):     price reverses against spike direction by sl × σ
+#   - timeout:                    max_hold snapshots elapse without hitting either
+# Label = which barrier is hit first.
+BARRIER_PT       = None    # not used — simple forward-return labeling
+BARRIER_SL       = None    # not used — simple forward-return labeling
+BARRIER_MAX_HOLD = 10      # forward window: 10 snapshots (~5 min) to observe reversal
+BARRIER_VOL_SPAN = 120     # lookback window for rolling volatility estimate (snapshots)
+
+# Label encoding:
+#   binary mode  → 1 = reversal (mean-reversion), 0 = continuation/timeout
+#   ternary mode → 0 = reversal, 1 = timeout, 2 = continuation
+LABEL_MODE       = "binary"
+
+LABEL_PAIR    = "ETHUSDT"  # primary pair — paper targets Ethereum spike-corrections
+
+SEQ_LEN     = 20    # input sequence length in snapshots (~10 min context for spike-correction)
 TRAIN_RATIO = 0.70
 CAL_RATIO   = 0.15  # calibration set for HopCPT, test set is whatever remains
 

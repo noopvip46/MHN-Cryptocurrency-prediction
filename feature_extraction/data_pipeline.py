@@ -1,4 +1,5 @@
 import glob
+import re
 import sys
 from pathlib import Path
 
@@ -40,6 +41,29 @@ def pivot_merged(out_base: str = "bookDepth_data", save: bool = False) -> pd.Dat
         if df.empty:
             print(f"  [{pair}] empty merged file, skipping")
             continue
+
+        # ── Coalesce integer/float duplicate columns ──────────────────────
+        # Some daily CSVs name levels as integers (e.g. _depth_-1), others
+        # as floats (_depth_-1.0).  When concatenated, each variant covers
+        # ~40–60% of rows — neither alone reaches full coverage.  Here we
+        # merge them: fill the integer column from the float column, then
+        # drop the float variant.  After this, every level has 100% non-null.
+        float_cols = [c for c in df.columns
+                      if re.match(r'.+_(depth|notional)_-?\d+\.0$', c)]
+        n_coalesced = 0
+        for fcol in float_cols:
+            int_col = re.sub(r'\.0$', '', fcol)
+            if int_col in df.columns:
+                df[int_col] = df[int_col].fillna(df[fcol])
+                df = df.drop(columns=[fcol])
+                n_coalesced += 1
+            else:
+                # Float-only column — rename to integer convention
+                df = df.rename(columns={fcol: int_col})
+                n_coalesced += 1
+        if n_coalesced:
+            print(f"  [{pair}] coalesced {n_coalesced} duplicate int/float columns")
+
         pair_dfs.append(df.sort_values("timestamp").reset_index(drop=True))
         print(f"  [{pair}] loaded: rows={len(df):,}  cols={len(df.columns)}")
 
@@ -78,21 +102,17 @@ def engineer_features(
     """Compute stationary order-book features; drop all raw non-stationary columns.
 
     Per pair computes:
-      - depth_imbalance_ratio       ∈ (−1, 1)  normalised quantity skew
-      - notional_imbalance_ratio    ∈ (−1, 1)  normalised value skew
-      - delta features (T vs T-1): depth_imbalance_ratio_delta,
-                                   notional_imbalance_ratio_delta,
-                                   total_notional_delta
-      - rolling z-scores:           notional_z (short), notional_regime_z (long)
-      - top-of-book thinness:       inner_book_ratio_z, book_slope_z
-                                    (only when ±0.2% level columns are present)
+      Core book features:
+        - depth_imbalance_ratio       ∈ (−1, 1)  normalised quantity skew
+        - inner_book_ratio_z          top-of-book liquidity thinness (z-scored)
+        - book_slope_z                shape of the book: near vs far liquidity
+
+      Spike-correction features:
+        - depth_change_z              rate of change in total depth (book recovery signal)
+        - imbalance_momentum          change in depth imbalance (shifting pressure)
 
     Raw per-level columns ({PAIR}_depth_{pct}, {PAIR}_notional_{pct}) are dropped
-    after the ratios are computed — they are non-stationary (absolute market size
-    drifts over time) and provide no benefit over the ratio/z-score representations.
-
-    Absolute intermediate aggregates (depth_imbalance, total_notional_neg/pos,
-    notional_imbalance) are also dropped for the same reason.
+    after the ratios are computed — they are non-stationary.
 
     The input DataFrame is not modified in place.
     """
@@ -115,81 +135,53 @@ def engineer_features(
             depth_imbalance / total_depth.replace(0, np.nan)
         )
 
-        # ── Notional ───────────────────────────────────────────────────────────
+        # ── Spike-correction: depth change rate ──────────────────────────────
+        # Z-scored rate of change in total depth. After a spike, rapid depth
+        # recovery (positive change) signals limit orders flooding back in →
+        # mean-reversion. Continued depth drain (negative) → continuation.
+        depth_pct_change = total_depth.pct_change().fillna(0)
+        dc_mean = depth_pct_change.rolling(roll_window, min_periods=1).mean()
+        dc_std  = depth_pct_change.rolling(roll_window, min_periods=1).std().replace(0, np.nan)
+        df[f"{pair}_depth_change_z"] = ((depth_pct_change - dc_mean) / dc_std).clip(-5, 5)
+
+        # ── Spike-correction: imbalance momentum ─────────────────────────────
+        # Change in depth imbalance ratio over last 5 snapshots (~2.5 min).
+        # Shifting imbalance = directional pressure building or unwinding.
+        imb = df[f"{pair}_depth_imbalance_ratio"]
+        df[f"{pair}_imbalance_momentum"] = imb.diff(5).fillna(0)
+
+        # ── Notional (aggregates only — used for book slope, not kept as features)
         notional_neg = [c for c in df.columns if c.startswith(f"{pair}_notional_-")]
         notional_pos = [c for c in df.columns if c.startswith(f"{pair}_notional_")
                         and not c.startswith(f"{pair}_notional_-")]
 
-        total_notional_neg = df[notional_neg].sum(axis=1)
-        total_notional_pos = df[notional_pos].sum(axis=1)
-        total_notional     = total_notional_neg + total_notional_pos
+        total_notional = df[notional_neg].sum(axis=1) + df[notional_pos].sum(axis=1)
 
-        notional_imbalance = total_notional_pos - total_notional_neg
-        df[f"{pair}_notional_imbalance_ratio"] = (
-            notional_imbalance / total_notional.replace(0, np.nan)
-        )
+        # ── Top-of-book thinness (book slope) ─────────────────────────────────
+        inner_bid_col = f"{pair}_notional_-1"
+        inner_ask_col = f"{pair}_notional_1"
 
-        # ── T vs T-1 deltas ────────────────────────────────────────────────────
-        df[f"{pair}_depth_imbalance_ratio_delta"]    = df[f"{pair}_depth_imbalance_ratio"].diff()
-        df[f"{pair}_notional_imbalance_ratio_delta"] = df[f"{pair}_notional_imbalance_ratio"].diff()
+        if inner_bid_col in df.columns and inner_ask_col in df.columns:
+            close_notional = df[inner_bid_col] + df[inner_ask_col]
+            print(f"  [{pair}] book slope using ±1%  ({inner_bid_col} / {inner_ask_col})")
 
-        # total_notional_delta: z-score the raw dollar change so it lives on the
-        # same scale as all other features.  The raw diff is in billions of USD
-        # and would dominate gradient updates.
-        raw_delta      = total_notional.diff()
-        delta_mean     = raw_delta.rolling(roll_window,   min_periods=1).mean()
-        delta_std      = raw_delta.rolling(roll_window,   min_periods=1).std().replace(0, np.nan)
-        df[f"{pair}_total_notional_delta_z"] = (raw_delta - delta_mean) / delta_std
-
-        # ── Rolling z-score normalisation ──────────────────────────────────────
-        log_notional = np.log1p(total_notional)
-
-        roll_mean = log_notional.rolling(roll_window,   min_periods=1).mean()
-        roll_std  = log_notional.rolling(roll_window,   min_periods=1).std().replace(0, np.nan)
-        df[f"{pair}_notional_z"] = (log_notional - roll_mean) / roll_std
-
-        regime_avg = log_notional.rolling(regime_window, min_periods=1).mean()
-        regime_std = log_notional.rolling(regime_window, min_periods=1).std().replace(0, np.nan)
-        df[f"{pair}_notional_regime_z"] = (log_notional - regime_avg) / regime_std
-
-        # ── Top-of-book thinness ───────────────────────────────────────────────
-        # The ±0.2% level is the closest to mid price — when market makers start
-        # withdrawing liquidity before a crash, this level empties first.
-        #
-        # inner_book_ratio_z: z-scored fraction of total book notional sitting at
-        #   the ±0.2% levels.  A sustained drop signals top-of-book withdrawal.
-        #
-        # book_slope_z: ratio of close (±0.2%) to far (±4%/±5%) notional, z-scored.
-        #   Drops when top-of-book is pulled relative to deep liquidity — the shape
-        #   of the book "flattens" at the top while staying thick far from mid.
-        close_bid = f"{pair}_notional_-0.2"
-        close_ask = f"{pair}_notional_0.2"
-        if close_bid in df.columns and close_ask in df.columns:
-            close_notional = df[close_bid] + df[close_ask]
-
-            # Inner book fraction (z-scored for stationarity)
             inner_frac = close_notional / total_notional.replace(0, np.nan)
             inner_mean = inner_frac.rolling(roll_window, min_periods=1).mean()
             inner_std  = inner_frac.rolling(roll_window, min_periods=1).std().replace(0, np.nan)
             df[f"{pair}_inner_book_ratio_z"] = (inner_frac - inner_mean) / inner_std
 
-            # Book slope: close levels vs deep levels (use -4/-5 if available)
-            outer_candidates = [
-                f"{pair}_notional_-4", f"{pair}_notional_4",
-                f"{pair}_notional_-5", f"{pair}_notional_5",
-                f"{pair}_notional_-4.0", f"{pair}_notional_4.0",
-                f"{pair}_notional_-5.0", f"{pair}_notional_5.0",
-            ]
-            outer_cols = [c for c in outer_candidates if c in df.columns]
+            outer_cols = [c for c in notional_neg + notional_pos
+                          if re.search(r"_notional_-?[45]$", c)]
             if outer_cols:
                 outer_notional = df[outer_cols].sum(axis=1)
                 book_slope     = close_notional / outer_notional.replace(0, np.nan)
                 slope_mean     = book_slope.rolling(roll_window, min_periods=1).mean()
                 slope_std      = book_slope.rolling(roll_window, min_periods=1).std().replace(0, np.nan)
                 df[f"{pair}_book_slope_z"] = (book_slope - slope_mean) / slope_std
+        else:
+            print(f"  [{pair}] book slope skipped — ±1% notional columns not found")
 
         # ── Drop raw non-stationary columns ────────────────────────────────────
-        # Raw per-level depth/notional: absolute and non-stationary
         raw_cols = depth_neg + depth_pos + notional_neg + notional_pos
         df = df.drop(columns=[c for c in raw_cols if c in df.columns])
 
@@ -243,15 +235,28 @@ def _derive_trade_features(agg: pd.DataFrame, roll_window: int, regime_window: i
     Input columns : timestamp, trade_count, trade_volume, trade_notional,
                     buy_volume, sell_volume
 
-    Output keeps only stationary derived columns:
-      vwap_return, vwap_volatility (label threshold only — excluded from model X),
-      vwap_return_5/10/20  (rolling cumulative returns at 2.5/5/10-min horizons),
-      vwap_vol_ratio       (short-term/long-term vol ratio — volatility acceleration),
-      buy_ratio, trade_flow_imbalance,
-      trade_intensity_z, trade_intensity_regime_z, trade_notional_z
+    Output keeps stationary derived columns relevant for spike-correction prediction:
 
-    Raw aggregate columns (trade_count, trade_volume, trade_notional, buy_volume,
-    sell_volume) are dropped — they are non-stationary level quantities.
+    Core price features:
+      vwap_return            — single-step return
+      vwap_volatility        — rolling vol (used for barrier sizing, excluded from model X)
+      vwap_return_5/10/20    — rolling cumulative returns at 2.5/5/10-min horizons
+
+    Spike-correction features:
+      return_zscore           — how abnormal is the current return (mean-reversion signal)
+      price_acceleration      — 2nd derivative of price: decelerating = reversal signal
+      volume_return_corr      — rolling correlation between volume and returns
+                                (high volume confirming move → continuation)
+      volume_surge            — current volume vs rolling average (spike on thin volume → revert)
+      return_skew             — rolling skewness of returns (asymmetry → directional pressure)
+
+    Volume & flow features:
+      vwap_vol_ratio          — short/long-term vol ratio (volatility acceleration)
+      buy_ratio               — fraction of volume that is taker-buy
+      trade_intensity_z       — z-scored trade count
+      trade_intensity_regime_z — long-window variant
+
+    Raw aggregate columns are dropped — they are non-stationary level quantities.
     """
     agg = agg.copy().sort_values("timestamp").reset_index(drop=True)
 
@@ -259,25 +264,51 @@ def _derive_trade_features(agg: pd.DataFrame, roll_window: int, regime_window: i
     agg["vwap_return"]          = vwap.pct_change()
     agg["vwap_volatility"]      = agg["vwap_return"].rolling(roll_window, min_periods=1).std()
 
-    # Multi-horizon cumulative returns — direct momentum signal.
-    # These are the past analogue of what the crash label measures forward:
-    # 5 periods ≈ 2.5 min, 10 periods ≈ 5 min, 20 periods ≈ 10 min.
+    # Multi-horizon cumulative returns — momentum at multiple scales.
     for h in [5, 10, 20]:
         agg[f"vwap_return_{h}"] = agg["vwap_return"].rolling(h, min_periods=1).sum()
 
-    # Volatility acceleration: short-term vol rising faster than long-term vol
-    # signals a market becoming increasingly unstable — a classic pre-crash signal.
+    # ── Spike-correction features ─────────────────────────────────────────
+
+    # Return z-score: how many σ is the current return from its rolling mean?
+    # Extreme values (|z| > 2-3) indicate abnormal moves likely to revert.
+    ret_mean = agg["vwap_return"].rolling(roll_window, min_periods=1).mean()
+    ret_std  = agg["vwap_return"].rolling(roll_window, min_periods=1).std().replace(0, np.nan)
+    agg["return_zscore"] = ((agg["vwap_return"] - ret_mean) / ret_std).clip(-5, 5)
+
+    # Price acceleration: change in return (2nd derivative of log-price).
+    # Positive when price is accelerating in current direction (continuation),
+    # negative when decelerating (reversal signal).
+    agg["price_acceleration"] = agg["vwap_return"].diff()
+
+    # Volume-price confirmation: rolling correlation between volume and abs returns.
+    # High correlation = volume confirms the move (continuation).
+    # Low/negative = divergence (potential reversal).
+    log_vol = np.log1p(agg["trade_volume"])
+    abs_ret = agg["vwap_return"].abs()
+    agg["volume_return_corr"] = log_vol.rolling(20, min_periods=5).corr(abs_ret).fillna(0)
+
+    # Volume surge: ratio of current trade volume to its rolling mean.
+    # Spikes on thin volume are more likely to revert than those on heavy volume.
+    vol_mean = log_vol.rolling(roll_window, min_periods=1).mean()
+    vol_std  = log_vol.rolling(roll_window, min_periods=1).std().replace(0, np.nan)
+    agg["volume_surge"] = ((log_vol - vol_mean) / vol_std).clip(-5, 5)
+
+    # Return skewness: rolling 3rd moment of returns.
+    # Positive skew = right tail (upward pressure), negative = downward pressure.
+    # Persistent skew in one direction predicts continuation; sudden reversal of
+    # skew predicts mean-reversion.
+    agg["return_skew"] = agg["vwap_return"].rolling(30, min_periods=10).skew().fillna(0).clip(-3, 3)
+
+    # ── Volatility & flow features ────────────────────────────────────────
+
     vol_short = agg["vwap_return"].rolling(10,  min_periods=1).std()
     vol_long  = agg["vwap_return"].rolling(60,  min_periods=1).std().replace(0, np.nan)
-    agg["vwap_vol_ratio"] = (vol_short / vol_long).clip(0, 10)  # clip prevents inf on cold-start rows
+    agg["vwap_vol_ratio"] = (vol_short / vol_long).clip(0, 10)
 
-    agg["buy_ratio"]            = agg["buy_volume"] / agg["trade_volume"].replace(0, np.nan)
-    agg["trade_flow_imbalance"] = (
-        (agg["buy_volume"] - agg["sell_volume"]) / agg["trade_volume"].replace(0, np.nan)
-    )
+    agg["buy_ratio"] = agg["buy_volume"] / agg["trade_volume"].replace(0, np.nan)
 
-    log_count    = np.log1p(agg["trade_count"])
-    log_notional = np.log1p(agg["trade_notional"])
+    log_count = np.log1p(agg["trade_count"])
 
     agg["trade_intensity_z"] = (
         (log_count - log_count.rolling(roll_window,   min_periods=1).mean()) /
@@ -286,10 +317,6 @@ def _derive_trade_features(agg: pd.DataFrame, roll_window: int, regime_window: i
     agg["trade_intensity_regime_z"] = (
         (log_count - log_count.rolling(regime_window, min_periods=1).mean()) /
         log_count.rolling(regime_window, min_periods=1).std().replace(0, np.nan)
-    )
-    agg["trade_notional_z"] = (
-        (log_notional - log_notional.rolling(roll_window, min_periods=1).mean()) /
-        log_notional.rolling(roll_window, min_periods=1).std().replace(0, np.nan)
     )
 
     # Drop raw non-stationary columns — only derived stationary features survive
@@ -461,6 +488,13 @@ def run_pipeline(
     if btc_imb in features.columns and eth_imb in features.columns:
         features["btceth_imbalance_spread"] = features[btc_imb] - features[eth_imb]
         print("[pipeline] added btceth_imbalance_spread")
+
+    # Drop cold-start rows where rolling windows are under-filled.
+    # The longest window is regime_window (480 rows = ~4 hours at 30s cadence).
+    # Before that point notional_z == notional_regime_z, multi-horizon returns
+    # are all identical, etc. — pure noise that would corrupt training.
+    features = features.iloc[regime_window:].reset_index(drop=True)
+    print(f"[pipeline] dropped first {regime_window} cold-start rows")
 
     # Defragment: columns were added one-by-one across the pipeline steps;
     # a single copy consolidates memory and eliminates pandas PerformanceWarning.

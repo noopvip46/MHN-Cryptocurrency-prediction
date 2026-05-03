@@ -1,4 +1,7 @@
-# Flash Crash Predictor — end-to-end offline pipeline
+# Spike-Correction Predictor — end-to-end offline pipeline
+# Detects price spikes (up & down) using CUSUM filtering and predicts
+# whether they will revert (mean-reversion) or continue (momentum)
+# using Triple Barrier labeling (López de Prado, AFML).
 # Run with --help for all options.
 
 import argparse
@@ -12,7 +15,8 @@ import numpy as np
 from config import (
     DEFAULT_PAIRS, DEFAULT_PERIOD, SEQ_LEN,
     ALL_PAIRS_TRADES, ALL_PAIRS_LABELED,
-    CRASH_HORIZON, CRASH_SIGMA,
+    CUSUM_H, CUSUM_EXPECTED,
+    BARRIER_MAX_HOLD, BARRIER_VOL_SPAN,
     BOOK_DEPTH_DIR, TRADES_DIR, ONCHAIN_DIR, ONCHAIN_SYMBOL,
 )
 
@@ -20,7 +24,7 @@ SEP = "=" * 55
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Flash Crash Predictor — offline pipeline")
+    p = argparse.ArgumentParser(description="Spike-Correction Predictor — offline pipeline")
 
     # Data
     p.add_argument("--pairs",    default=",".join(DEFAULT_PAIRS),
@@ -104,9 +108,9 @@ def parse_args():
     # External dataset support
     p.add_argument("--data-file",   default=None,
                    help="Path to a pre-built labeled CSV (skips download/extract/label). "
-                        "Must contain timestamp, feature columns, and {label-pair}_flash_crash_label.")
+                        "Must contain timestamp, feature columns, and {label-pair}_spike_event/label.")
     p.add_argument("--label-pair",  default=None,
-                   help="Pair name whose flash_crash_label column is used as the target "
+                   help="Pair name whose spike_label column is used as the target "
                         "(default: LABEL_PAIR from config.py, currently BTCUSDT). "
                         "Use this when running on a colleague's dataset with different pair names.")
 
@@ -179,7 +183,7 @@ def step_extract(pairs, no_onchain: bool = False, save_intermediates: bool = Fal
 
     from feature_extraction.data_pipeline import run_pipeline
     t0 = time.time()
-    run_pipeline(
+    features_df = run_pipeline(
         trading_pairs      = pairs,
         out_base           = str(BOOK_DEPTH_DIR),
         trades_base        = str(TRADES_DIR),
@@ -189,19 +193,95 @@ def step_extract(pairs, no_onchain: bool = False, save_intermediates: bool = Fal
         save_intermediates = save_intermediates,
     )
     print(f"  Feature extraction complete in {time.time()-t0:.0f}s.")
+    return features_df
 
 
 # ── Step 3: Label generation ──────────────────────────────────────────────────
 
-def step_label(pairs, features_df=None):
-    """Generate flash crash labels.
+def _cusum_filter(returns, h, expected=0.0):
+    """CUSUM event filter (López de Prado AFML Ch. 2).
 
-    If features_df is provided (in-memory from step_extract with --no-save),
-    labels are applied directly.  Otherwise all_pairs_with_trades.csv is read
-    from disk (requires --save-intermediates or a previous run with it).
+    Maintains two running cumulative sums tracking upward and downward
+    deviations from the expected return.  When either sum exceeds the
+    threshold h, a spike event is recorded and both sums are reset.
+
+    Returns
+    -------
+    events : list of (index, direction, magnitude)
+        index     — row index where the spike was detected
+        direction — +1 for upward spike, -1 for downward spike
+        magnitude — absolute value of the cumulative sum at trigger (≥ h)
+    """
+    s_pos, s_neg = 0.0, 0.0
+    events = []
+    for i, r in enumerate(returns):
+        diff = r - expected
+        s_pos = max(0.0, s_pos + diff)
+        s_neg = min(0.0, s_neg + diff)
+        if s_pos > h:
+            events.append((i, +1, s_pos))
+            s_pos = 0.0
+            s_neg = 0.0
+        elif s_neg < -h:
+            events.append((i, -1, abs(s_neg)))
+            s_pos = 0.0
+            s_neg = 0.0
+    return events
+
+
+def _volatility_label(returns, event_idx, max_hold):
+    """Post-spike volatility labeling.
+
+    After a spike event, measure the realized volatility over the next max_hold
+    snapshots.  Label = 1 if the post-spike period is highly volatile (above
+    median for the dataset), label = 0 if the spike is quickly absorbed and
+    the market calms down.
+
+    This reframes the prediction task from "direction" (unpredictable) to
+    "activity regime" (predictable from order book state):
+    - Thin books + volume surge → continued high volatility (label=1)
+    - Deep books + low intensity → spike absorbed (label=0)
+
+    Parameters
+    ----------
+    returns   : array-like, per-snapshot returns
+    event_idx : int, row where the spike was detected
+    max_hold  : int, forward window (snapshots) over which to measure volatility
+
+    Returns
+    -------
+    realized_vol : float
+        Standard deviation of returns in the forward window
+    """
+    T = len(returns)
+    end = min(event_idx + max_hold + 1, T)
+    fwd_returns = returns[event_idx + 1 : end]
+
+    if len(fwd_returns) < 3:
+        return 0.0
+
+    return float(np.std(fwd_returns))
+
+
+def step_label(pairs, features_df=None):
+    """Generate spike-correction labels using CUSUM filter + Triple Barrier.
+
+    Pipeline (López de Prado, Advances in Financial Machine Learning):
+    1. CUSUM filter detects spike events (both up and down) in vwap_return.
+    2. For each spike event, Triple Barrier determines whether the price
+       reverts (mean-reversion → label=1) or continues/times-out (label=0).
+    3. Events from all pairs are combined; the label from the primary pair
+       (LABEL_PAIR) is used as the training target.
+
+    Spike events are a small subset of all rows — models train only on these
+    event rows, not every 30-second snapshot.
+
+    If features_df is provided (in-memory from step_extract), labels are applied
+    directly.  Otherwise all_pairs_with_trades.csv is read from disk.
     """
     print(f"\n{SEP}")
-    print(f"  Step 3/4 — Label generation")
+    print(f"  Step 3/4 — Label generation (CUSUM h={CUSUM_H}, "
+          f"forward-return reversal, window={BARRIER_MAX_HOLD} snapshots)")
     print(SEP)
 
     if features_df is not None:
@@ -215,27 +295,87 @@ def step_label(pairs, features_df=None):
         df = pd.read_csv(ALL_PAIRS_TRADES, parse_dates=["timestamp"])
         df = df.sort_values("timestamp").reset_index(drop=True)
 
+    from config import LABEL_PAIR
+
     for pair in pairs:
-        vwap_ret = df[f"{pair}_vwap_return"]
-        vwap_vol = df[f"{pair}_vwap_volatility"]
-        fwd      = vwap_ret.rolling(CRASH_HORIZON).sum().shift(-CRASH_HORIZON)
-        # Scale threshold by sqrt(CRASH_HORIZON) so both sides are on the same
-        # distributional scale.  fwd is a sum of CRASH_HORIZON iid returns, so
-        # std(fwd) = vwap_vol × sqrt(CRASH_HORIZON).  Without this factor the
-        # threshold sits at -CRASH_SIGMA/sqrt(20) ≈ -0.67 std devs of the forward
-        # distribution, labelling ~25% of rows as crashes.  With the factor, a
-        # CRASH_SIGMA=2.0 threshold sits at -2 std devs → ~2.3% crash rate.
-        threshold = -CRASH_SIGMA * vwap_vol * np.sqrt(CRASH_HORIZON)
-        df[f"{pair}_flash_crash_label"] = (fwd < threshold).astype("Int8")
+        ret_col = f"{pair}_vwap_return"
+        vol_col = f"{pair}_vwap_volatility"
 
-        n   = int(df[f"{pair}_flash_crash_label"].sum())
-        pct = 100 * n / len(df)
-        ratio = int((len(df) - n) / max(n, 1))
-        print(f"  {pair}: {n} crash events ({pct:.2f}%)  class ratio 1:{ratio}")
+        if ret_col not in df.columns:
+            print(f"  [WARN] {ret_col} not found, skipping {pair}")
+            continue
 
-    df = df.iloc[:-CRASH_HORIZON].reset_index(drop=True)
+        returns = df[ret_col].fillna(0.0).values
+        vol     = df[vol_col].fillna(0.01).values if vol_col in df.columns else \
+                  pd.Series(returns).rolling(BARRIER_VOL_SPAN, min_periods=30).std().fillna(0.01).values
+
+        # 1) CUSUM filter — detect spike events
+        events = _cusum_filter(returns, h=CUSUM_H, expected=CUSUM_EXPECTED)
+        print(f"  {pair}: CUSUM detected {len(events)} spike events "
+              f"(up={sum(1 for _,d,_ in events if d>0)}, "
+              f"down={sum(1 for _,d,_ in events if d<0)})")
+
+        # 2) Post-spike volatility measurement
+        spike_event = np.zeros(len(df), dtype=np.int8)
+        spike_dir   = np.zeros(len(df), dtype=np.int8)
+        spike_mag   = np.zeros(len(df), dtype=np.float32)
+        spike_fwd_vol = np.zeros(len(df), dtype=np.float32)
+
+        # Skip events too close to the end (need max_hold snapshots forward)
+        valid_events = [(idx, d, mag) for idx, d, mag in events
+                        if idx + BARRIER_MAX_HOLD < len(df)]
+
+        for idx, direction, magnitude in valid_events:
+            fwd_vol = _volatility_label(returns, idx, max_hold=BARRIER_MAX_HOLD)
+            spike_event[idx] = 1
+            spike_dir[idx]   = direction
+            spike_mag[idx]   = magnitude
+            spike_fwd_vol[idx] = fwd_vol
+
+        # Label by median split: high post-spike volatility (1) vs low (0)
+        event_vols = spike_fwd_vol[spike_event == 1]
+        vol_median = np.median(event_vols) if len(event_vols) > 0 else 0.0
+        spike_label = np.where(
+            (spike_event == 1) & (spike_fwd_vol > vol_median), 1, 0
+        ).astype(np.int8)
+
+        df[f"{pair}_spike_event"]     = pd.array(spike_event, dtype="Int8")
+        df[f"{pair}_spike_label"]     = pd.array(spike_label, dtype="Int8")
+        df[f"{pair}_spike_direction"] = pd.array(spike_dir, dtype="Int8")
+
+        # ── Spike-characterizing MODEL features (not dropped by data_adapter) ─
+        df[f"{pair}_spike_magnitude"] = spike_mag
+        df[f"{pair}_spike_dir_signed"] = spike_dir.astype(np.float32)
+        local_vol_at_event = np.where(spike_event == 1, vol, np.nan)
+        vol_norm = np.where(spike_event == 1,
+                            spike_mag / np.maximum(local_vol_at_event, 1e-6), 0.0)
+        df[f"{pair}_spike_vol_normalized"] = vol_norm.astype(np.float32)
+
+        n_events  = int(spike_event.sum())
+        n_high    = int(spike_label.sum())
+        n_low     = n_events - n_high
+        print(f"  {pair}: {n_events} valid events → "
+              f"high_vol={n_high} (50%)  low_vol={n_low} (50%)"
+              f"  median_vol={vol_median:.6f}"
+              f"  (fwd window={BARRIER_MAX_HOLD} snapshots = {BARRIER_MAX_HOLD*30//60} min)")
+
+    # ── For the primary label pair, copy its spike columns as the training target
+    primary_event_col = f"{LABEL_PAIR}_spike_event"
+    primary_label_col = f"{LABEL_PAIR}_spike_label"
+
+    if primary_event_col not in df.columns:
+        raise KeyError(f"Primary label pair {LABEL_PAIR} has no spike events. "
+                       f"Check that {LABEL_PAIR} is in --pairs.")
+
+    # Trim rows at the end that can't have valid forward barriers
+    df = df.iloc[:-BARRIER_MAX_HOLD].reset_index(drop=True)
+
     df.to_csv(ALL_PAIRS_LABELED, index=False)
-    print(f"  Saved: {ALL_PAIRS_LABELED}  rows={len(df):,}  cols={len(df.columns)}")
+    n_events_total = int(df[primary_event_col].sum())
+    n_high_total = int(df.loc[df[primary_event_col] == 1, primary_label_col].sum())
+    print(f"\n  Saved: {ALL_PAIRS_LABELED}  rows={len(df):,}  cols={len(df.columns)}")
+    print(f"  Training target ({LABEL_PAIR}): {n_events_total} events, "
+          f"high_vol={n_high_total}, low_vol={n_events_total - n_high_total}")
     return df
 
 
@@ -408,10 +548,11 @@ def main():
         print("[WARN] --no-save + --skip-extract: no intermediate file to resume from.")
         print("       Remove --skip-extract or add --save-intermediates on the previous run.")
 
-    print(f"\nFlash Crash Predictor")
+    print(f"\nSpike-Correction Predictor")
     print(f"  Pairs      : {pairs}")
     print(f"  Period     : {args.period}")
     print(f"  Model      : {args.model}  device={device}  conformal={use_conformal}")
+    print(f"  Labeling   : CUSUM (h={CUSUM_H}) + forward-return reversal (window={BARRIER_MAX_HOLD} snapshots = {BARRIER_MAX_HOLD*30//60} min)")
     print(f"  On-chain   : {'disabled' if args.no_onchain else 'enabled'}")
     print(f"  Intermediates saved: {save_inter}")
     if args.resume:
@@ -427,24 +568,11 @@ def main():
             print("\n[SKIP] Download")
 
         if not args.skip_extract:
-            if args.no_save:
-                # Run pipeline and hold result in memory for step_label
-                from feature_extraction.data_pipeline import run_pipeline
-                from config import ALL_PAIRS_TRADES
-                print(f"\n{SEP}\n  Step 2/4 — Feature extraction (in-memory)\n{SEP}")
-                t0 = time.time()
-                features_df = run_pipeline(
-                    trading_pairs      = pairs,
-                    out_base           = str(BOOK_DEPTH_DIR),
-                    trades_base        = str(TRADES_DIR),
-                    onchain_base       = str(ONCHAIN_DIR),
-                    onchain_symbol     = ONCHAIN_SYMBOL,
-                    skip_onchain       = args.no_onchain,
-                    save_intermediates = False,
-                )
-                print(f"  Feature extraction complete in {time.time()-t0:.0f}s.")
-            else:
-                step_extract(pairs, no_onchain=args.no_onchain, save_intermediates=True)
+            features_df = step_extract(
+                pairs,
+                no_onchain=args.no_onchain,
+                save_intermediates=not args.no_save,
+            )
         else:
             print("\n[SKIP] Feature extraction")
 

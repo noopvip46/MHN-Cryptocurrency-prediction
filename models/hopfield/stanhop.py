@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from models.base import BaseFlashCrashModel
-from models.data_adapter import WindowDataset
+from models.data_adapter import WindowDataset, make_balanced_sampler
 from models.losses import FocalLoss
 
 
@@ -146,8 +146,14 @@ class STanHopModel(BaseFlashCrashModel):
 
         n_pos = int(y_train.sum())
         n_neg = len(y_train) - n_pos
-        alpha    = n_neg / max(n_pos + n_neg, 1)   # ≈ 0.98 for 50:1 imbalance
-        criterion = FocalLoss(alpha=alpha, gamma=2.0).to(self.device)
+        alpha = n_neg / max(n_pos + n_neg, 1)
+
+        if 0.45 <= alpha <= 0.55:
+            criterion = nn.BCEWithLogitsLoss().to(self.device)
+            print(f"  [{self.name}] balanced classes (alpha={alpha:.3f}) → BCEWithLogitsLoss")
+        else:
+            criterion = FocalLoss(alpha=alpha, gamma=2.0).to(self.device)
+            print(f"  [{self.name}] imbalanced classes (alpha={alpha:.3f}) → FocalLoss")
 
         optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
@@ -177,13 +183,23 @@ class STanHopModel(BaseFlashCrashModel):
             }, p)
             return p
 
+        sampler = make_balanced_sampler(y_train) if alpha > 0.55 or alpha < 0.45 else None
         loader = DataLoader(
             WindowDataset(X_train, y_train),
-            batch_size=self.batch_size, shuffle=True, drop_last=False,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            shuffle=(sampler is None),
+            drop_last=False,
             num_workers=0,
         )
 
         self._last_epoch = start_epoch - 1
+        best_val_ap    = -1.0
+        best_state     = None
+        patience       = 10
+        wait           = 0
+        import copy
+
         try:
             self._net.train()
             for epoch in range(start_epoch, self.epochs + 1):
@@ -204,17 +220,33 @@ class STanHopModel(BaseFlashCrashModel):
                 if ckpt_dir:
                     _save_checkpoint(epoch)
 
-                # Print loss every epoch; val metrics every 5 epochs (evaluate is expensive)
                 msg = f"[{self.name}] epoch {epoch:>3}/{self.epochs}  loss={epoch_loss:.5f}"
-                if X_val is not None and y_val is not None and (epoch % 5 == 0 or epoch == self.epochs):
+                if X_val is not None and y_val is not None:
                     val = self.evaluate(X_val, y_val)
                     msg += f"  val_auc={val['roc_auc']:.4f}  val_ap={val['avg_prec']:.4f}"
+                    if val["avg_prec"] > best_val_ap:
+                        best_val_ap = val["avg_prec"]
+                        best_state  = copy.deepcopy(self._net.state_dict())
+                        wait = 0
+                        msg += "  ★"
+                    else:
+                        wait += 1
+                        if wait >= patience:
+                            print(msg, flush=True)
+                            print(f"[{self.name}] early stop at epoch {epoch} "
+                                  f"(no val_ap improvement for {patience} epochs, "
+                                  f"best={best_val_ap:.4f})")
+                            break
                 print(msg, flush=True)
 
         except KeyboardInterrupt:
             p = _save_checkpoint(self._last_epoch)
             print(f"\n  [{self.name}] interrupted at epoch {self._last_epoch} — checkpoint saved → {p}")
             raise
+
+        if best_state is not None:
+            self._net.load_state_dict(best_state)
+            print(f"[{self.name}] restored best model (val_ap={best_val_ap:.4f})")
 
         return self
 

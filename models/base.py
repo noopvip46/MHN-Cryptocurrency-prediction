@@ -1,4 +1,4 @@
-# Abstract base class that every flash crash model in this project inherits from.
+# Abstract base class that every spike-correction model in this project inherits from.
 # Subclasses must implement fit and predict_proba.
 # predict and evaluate are provided here and work automatically once those two are implemented.
 
@@ -7,7 +7,9 @@ from abc import ABC, abstractmethod
 import numpy as np
 from sklearn.metrics import (
     average_precision_score,
+    balanced_accuracy_score,
     f1_score,
+    matthews_corrcoef,
     precision_score,
     precision_recall_curve,
     recall_score,
@@ -36,20 +38,32 @@ class BaseFlashCrashModel(ABC):
         return (self.predict_proba(X) >= threshold).astype(int)
 
     def evaluate(self, X, y):
-        # Compute a standard set of binary classification metrics.
-        # We use average precision (area under PR curve) as the primary metric
-        # since flash crash datasets are heavily imbalanced — accuracy is meaningless here.
+        # Metrics for binary classification (reversal vs continuation).
         #
-        # Also reports metrics at the *optimal* F1 threshold (found via PR curve sweep)
-        # rather than the meaningless 0.5 default, since for 1:50+ imbalance the right
-        # threshold is typically in the 0.05–0.20 range.
+        # With CUSUM + Triple Barrier labeling, the class balance is typically
+        # closer to 50/50 than the old crash labels (~1:50), but can still be
+        # imbalanced depending on barrier parameters and market regime.
+        #
+        # Threshold-free (primary):
+        #   roc_auc    — overall discrimination ability
+        #   avg_prec   — area under precision-recall curve
+        #
+        # Threshold-dependent (all computed at the optimal F1 threshold):
+        #   balanced_acc — mean of per-class recall; unaffected by class imbalance
+        #   mcc          — Matthews Correlation Coefficient [-1, 1], 0 = random
+        #   f1_macro     — mean of F1 for each class
+        #   f1           — F1 for the positive (reversal) class
+        #   precision / recall — at the same optimal threshold
+        #
+        # The optimal threshold is found by sweeping the precision-recall curve.
         y = np.asarray(y, dtype=int)
         probs = self.predict_proba(X)
 
         n_pos = y.sum()
         n_neg = len(y) - n_pos
         if n_pos == 0 or n_neg == 0:
-            print(f"[{self.name}] evaluate: only one class present in y (pos={n_pos}, neg={n_neg}), some metrics will be 0.")
+            print(f"[{self.name}] evaluate: only one class present "
+                  f"(pos={n_pos}, neg={n_neg}), some metrics will be 0.")
 
         try:
             roc_auc = roc_auc_score(y, probs)
@@ -61,30 +75,31 @@ class BaseFlashCrashModel(ABC):
         except ValueError:
             avg_prec = float("nan")
 
-        # Find optimal F1 threshold via precision-recall curve sweep.
-        # precision_recall_curve returns arrays of length n_thresholds+1; the last
-        # element has no corresponding threshold (represents the "predict all positive"
-        # point) so we search only over the first n_thresholds entries.
+        # Sweep PR curve to find threshold that maximises positive-class F1.
         try:
             prec_arr, rec_arr, thr_arr = precision_recall_curve(y, probs)
-            # prec_arr and rec_arr have one more element than thr_arr
             prec_t = prec_arr[:-1]
             rec_t  = rec_arr[:-1]
-            f1_arr = 2 * prec_t * rec_t / (prec_t + rec_t + 1e-9)
-            best_i = int(f1_arr.argmax())
+            f1_t   = 2 * prec_t * rec_t / (prec_t + rec_t + 1e-9)
+            best_i = int(f1_t.argmax())
             best_thr = float(thr_arr[best_i])
         except Exception:
             best_thr = 0.5
 
-        preds_opt = (probs >= best_thr).astype(int)
+        preds = (probs >= best_thr).astype(int)
 
         return {
-            "roc_auc":        roc_auc,
-            "avg_prec":       avg_prec,
-            "opt_threshold":  best_thr,
-            "f1":             f1_score(y, preds_opt, zero_division=0),
-            "precision":      precision_score(y, preds_opt, zero_division=0),
-            "recall":         recall_score(y, preds_opt, zero_division=0),
+            # ── threshold-free ────────────────────────────────────────────────
+            "roc_auc":       roc_auc,
+            "avg_prec":      avg_prec,
+            # ── threshold-dependent (at optimal F1 threshold) ─────────────────
+            "opt_threshold": best_thr,
+            "balanced_acc":  balanced_accuracy_score(y, preds),
+            "mcc":           matthews_corrcoef(y, preds),
+            "f1_macro":      f1_score(y, preds, average="macro",    zero_division=0),
+            "f1":            f1_score(y, preds, average="binary",   zero_division=0),
+            "precision":     precision_score(y, preds,              zero_division=0),
+            "recall":        recall_score(y, preds,                 zero_division=0),
         }
 
     def save(self, path):
