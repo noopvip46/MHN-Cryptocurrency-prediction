@@ -147,6 +147,37 @@ class SequenceDataset:
         drop_cols = ["timestamp"] + spike_cols + legacy_cols + vwap_vol_cols
         feature_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
+        # ── Keep only primary pair features + global features ─────────────────
+        # Non-primary pair columns add noise with limited benefit for small
+        # event datasets.  Keep: primary pair features, time features (hour/dow),
+        # and any global feature that doesn't start with a pair prefix.
+        all_pairs_in_cols = set()
+        for col in feature_df.columns:
+            parts = col.split("_")
+            if len(parts) >= 2 and parts[0].isupper() and parts[0].endswith("USDT"):
+                all_pairs_in_cols.add(parts[0] + "_" + parts[1].split("USDT")[0] if "USDT" in parts[1] else parts[0])
+        # Simpler: drop columns that start with a known non-primary pair prefix
+        non_primary_prefixes = [p for p in all_pairs_in_cols
+                                if not p.startswith(self.label_pair)]
+        # Find all unique pair prefixes (e.g., "BTCUSDT", "ETHUSDT")
+        pair_prefixes = set()
+        for col in feature_df.columns:
+            for pair in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"]:
+                if col.startswith(f"{pair}_"):
+                    pair_prefixes.add(pair)
+                    break
+        other_pairs = pair_prefixes - {self.label_pair}
+        if other_pairs:
+            other_pair_cols = [c for c in feature_df.columns
+                              if any(c.startswith(f"{p}_") for p in other_pairs)]
+            # Also drop cross-pair features that reference the other pair
+            cross_pair_cols = [c for c in feature_df.columns
+                              if c.startswith("btceth_") or c.startswith("ethbtc_")]
+            drop_other = other_pair_cols + cross_pair_cols
+            feature_df = feature_df.drop(columns=[c for c in drop_other if c in feature_df.columns])
+            print(f"[SequenceDataset] dropped {len(drop_other)} non-primary pair columns "
+                  f"(keeping {self.label_pair} only)")
+
         # Forward-fill then back-fill NaNs — book depth snapshots can have small gaps
         feature_df = feature_df.ffill().bfill()
 

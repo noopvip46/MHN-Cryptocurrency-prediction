@@ -18,6 +18,7 @@ from config import (
     CUSUM_H, CUSUM_EXPECTED,
     BARRIER_MAX_HOLD, BARRIER_VOL_SPAN,
     BOOK_DEPTH_DIR, TRADES_DIR, ONCHAIN_DIR, ONCHAIN_SYMBOL,
+    ROLL_WINDOW_SHORT, ROLL_WINDOW_REGIME,
 )
 
 SEP = "=" * 55
@@ -187,6 +188,8 @@ def step_extract(pairs, no_onchain: bool = False, save_intermediates: bool = Fal
         trading_pairs      = pairs,
         out_base           = str(BOOK_DEPTH_DIR),
         trades_base        = str(TRADES_DIR),
+        roll_window        = ROLL_WINDOW_SHORT,
+        regime_window      = ROLL_WINDOW_REGIME,
         onchain_base       = str(ONCHAIN_DIR),
         onchain_symbol     = ONCHAIN_SYMBOL,
         skip_onchain       = no_onchain,
